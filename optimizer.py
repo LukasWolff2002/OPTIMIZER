@@ -52,7 +52,7 @@ def optimize():
 
     search_params = pywrapcp.DefaultRoutingSearchParameters()
     search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    search_params.time_limit.seconds = 5  # límite de tiempo por seguridad
+    search_params.time_limit.seconds = 20  # límite de tiempo por seguridad
 
     solution = routing.SolveWithParameters(search_params)
 

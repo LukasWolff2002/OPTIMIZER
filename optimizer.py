@@ -16,6 +16,7 @@ def optimize():
     depot = 0
     n = len(locations)
 
+    # Configuración de OR-Tools para la gestión de rutas
     manager = pywrapcp.RoutingIndexManager(n, num_vehicles, depot)
     routing = pywrapcp.RoutingModel(manager)
 
@@ -37,23 +38,25 @@ def optimize():
         "Capacity"
     )
 
+    # Agregar la dimensión de paradas (número máximo de paradas por vehículo)
     def count_callback(from_index):
         return 1  # cada nodo cuenta como 1 parada
 
     count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
     routing.AddDimension(
         count_callback_index,
-        0,
-        max_stops_per_vehicle,
-        True,
+        0,  # No hay valor de slack, debe ser 0
+        max_stops_per_vehicle,  # Número máximo de paradas
+        True,  # Cualquier vehículo puede sobrepasar la restricción (que será manejado por el solver)
         "Stops"
     )
 
-
+    # Definir la estrategia de búsqueda
     search_params = pywrapcp.DefaultRoutingSearchParameters()
     search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_params.time_limit.seconds = 20  # límite de tiempo por seguridad
 
+    # Resolver el problema
     solution = routing.SolveWithParameters(search_params)
 
     if not solution:
@@ -62,6 +65,7 @@ def optimize():
     total_cost = 0
     rutas = []
 
+    # Recolectar las rutas de cada vehículo
     for v in range(num_vehicles):
         index = routing.Start(v)
         ruta = []
@@ -71,9 +75,10 @@ def optimize():
             total_cost += routing.GetArcCostForVehicle(index, next_index, v)
             index = next_index
         ruta.append(manager.IndexToNode(index))
-        if len(ruta) > 1:  # solo si el vehículo se usa
+        if len(ruta) > 1:  # Solo si el vehículo se usa
             rutas.append(ruta)
 
+    # Devolver los resultados
     return jsonify({
         "used_vehicles": len(rutas),
         "total_cost": total_cost,
@@ -82,4 +87,3 @@ def optimize():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-

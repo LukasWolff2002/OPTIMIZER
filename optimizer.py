@@ -39,18 +39,22 @@ def optimize():
         transit_callback_index = routing.RegisterTransitCallback(distance_callback)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
+        # Crear una dimensión por producto
+        capacity_dimensions = {}
         for product, demands in product_demands.items():
             def demand_callback(from_index, demands=demands):
                 return demands[manager.IndexToNode(from_index)]
             demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
             routing.AddDimensionWithVehicleCapacity(
                 demand_callback_index,
-                0,
+                0,  # no slack
                 [vehicle_capacity] * num_vehicles,
                 True,
                 f"Capacity_{product}"
             )
+            capacity_dimensions[product] = routing.GetDimensionOrDie(f"Capacity_{product}")
 
+        # Dimensión de paradas
         def count_callback(from_index):
             return 1
         count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
@@ -73,27 +77,55 @@ def optimize():
 
         total_cost = 0
         rutas = []
+        deliveries = []
 
         for v in range(num_vehicles):
             index = routing.Start(v)
             ruta = []
+            vehicle_deliveries = []
+
+            prev_load = {product: 0 for product in all_products}
+
             while not routing.IsEnd(index):
-                ruta.append(manager.IndexToNode(index))
+                node_index = manager.IndexToNode(index)
+                ruta.append(node_index)
+
+                delivered_here = {}
+                for product, dim in capacity_dimensions.items():
+                    load = solution.Value(dim.CumulVar(index))
+                    if index == routing.Start(v):
+                        delivered_here[product] = 0
+                        prev_load[product] = load
+                    else:
+                        delivered = prev_load[product] - load
+                        delivered_here[product] = delivered
+                        prev_load[product] = load
+
+                vehicle_deliveries.append({
+                    "location_index": node_index,
+                    "delivered": delivered_here
+                })
+
                 next_index = solution.Value(routing.NextVar(index))
                 total_cost += routing.GetArcCostForVehicle(index, next_index, v)
                 index = next_index
-            ruta.append(manager.IndexToNode(index))
-            if len(ruta) > 1:
+
+            # add depot return
+            node_index = manager.IndexToNode(index)
+            ruta.append(node_index)
+            deliveries.append(vehicle_deliveries)
+
+            if len(ruta) > 2:
                 rutas.append(ruta)
 
         return jsonify({
             "used_vehicles": len(rutas),
             "total_cost": total_cost,
-            "routes": rutas
+            "routes": rutas,
+            "deliveries": deliveries
         })
 
     except Exception as e:
-        # Devuelve el error como JSON
         return jsonify(error=f"Error interno: {str(e)}"), 500
 
 if __name__ == "__main__":

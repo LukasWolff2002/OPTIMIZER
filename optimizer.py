@@ -12,51 +12,64 @@ def optimize():
     vehicle_capacity = data["vehicle_capacity"]
     max_stops_per_vehicle = data["max_stops"]
     distance_matrix = data["distance_matrix"]
-    demands = [loc.get("demanda", 0) for loc in locations]
+
+    # Extraer el set de productos únicos
+    all_products = set()
+    for loc in locations:
+        if isinstance(loc.get("demanda"), dict):
+            all_products.update(loc["demanda"].keys())
+    all_products = sorted(all_products)
+
+    # Crear demandas por producto
+    product_demands = {product: [] for product in all_products}
+    for loc in locations:
+        demanda = loc.get("demanda", {})
+        for product in all_products:
+            product_demands[product].append(demanda.get(product, 0))
+
     depot = 0
     n = len(locations)
 
-    # Configuración de OR-Tools para la gestión de rutas
+    # OR-Tools manager y modelo
     manager = pywrapcp.RoutingIndexManager(n, num_vehicles, depot)
     routing = pywrapcp.RoutingModel(manager)
 
+    # Callback de distancia
     def distance_callback(from_index, to_index):
         return distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    def demand_callback(from_index):
-        return demands[manager.IndexToNode(from_index)]
+    # Crear una dimensión por producto
+    for product, demands in product_demands.items():
+        def demand_callback(from_index, demands=demands):
+            return demands[manager.IndexToNode(from_index)]
+        demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
+        routing.AddDimensionWithVehicleCapacity(
+            demand_callback_index,
+            0,
+            [vehicle_capacity] * num_vehicles,  # Puedes parametrizar por producto si lo deseas
+            True,
+            f"Capacity_{product}"
+        )
 
-    demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-    routing.AddDimensionWithVehicleCapacity(
-        demand_callback_index,
-        0,
-        [vehicle_capacity] * num_vehicles,
-        True,
-        "Capacity"
-    )
-
-    # Agregar la dimensión de paradas (número máximo de paradas por vehículo)
+    # Dimensión de paradas
     def count_callback(from_index):
-        return 1  # cada nodo cuenta como 1 parada
-
+        return 1
     count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
     routing.AddDimension(
         count_callback_index,
-        0,  # No hay valor de slack, debe ser 0
-        max_stops_per_vehicle,  # Número máximo de paradas
-        True,  # Cualquier vehículo puede sobrepasar la restricción (que será manejado por el solver)
+        0,
+        max_stops_per_vehicle,
+        True,
         "Stops"
     )
 
-    # Definir la estrategia de búsqueda
+    # Estrategia de búsqueda
     search_params = pywrapcp.DefaultRoutingSearchParameters()
     search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    search_params.time_limit.seconds = 20  # límite de tiempo por seguridad
+    search_params.time_limit.seconds = 20
 
-    # Resolver el problema
     solution = routing.SolveWithParameters(search_params)
 
     if not solution:
@@ -65,7 +78,6 @@ def optimize():
     total_cost = 0
     rutas = []
 
-    # Recolectar las rutas de cada vehículo
     for v in range(num_vehicles):
         index = routing.Start(v)
         ruta = []
@@ -75,10 +87,9 @@ def optimize():
             total_cost += routing.GetArcCostForVehicle(index, next_index, v)
             index = next_index
         ruta.append(manager.IndexToNode(index))
-        if len(ruta) > 1:  # Solo si el vehículo se usa
+        if len(ruta) > 1:
             rutas.append(ruta)
 
-    # Devolver los resultados
     return jsonify({
         "used_vehicles": len(rutas),
         "total_cost": total_cost,

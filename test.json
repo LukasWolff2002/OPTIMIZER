@@ -1,0 +1,27 @@
+{
+  "locations": [
+    {
+      "lat": -33.0,
+      "lng": -70.0,
+      "demanda": {
+        "Producto A": 15,
+        "Producto B": 30
+      }
+    },
+    {
+      "lat": -32.9,
+      "lng": -70.1,
+      "demanda": {
+        "Producto A": 10,
+        "Producto B": 5
+      }
+    }
+  ],
+  "distance_matrix": [
+    [0, 10],
+    [10, 0]
+  ],
+  "max_vehicles": 2,
+  "vehicle_capacity": 100,
+  "max_stops": 5
+}

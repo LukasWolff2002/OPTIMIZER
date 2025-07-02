@@ -25,7 +25,9 @@ def optimize():
     for loc in locations:
         demanda = loc.get("demanda", {})
         for product in all_products:
-            product_demands[product].append(demanda.get(product, 0))
+            valor = demanda.get(product, 0)
+            product_demands[product].append(int(valor))
+
 
     depot = 0
     n = len(locations)

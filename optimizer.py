@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import json
 import time
 import threading
 
 app = Flask(__name__)
+CORS(app)  # Habilitar CORS para aceptar requests desde cualquier dominio
 
 # Aquí se guardan los progresos por job_id
 tasks = {}
@@ -14,7 +16,6 @@ def start_optimization():
     data = request.get_json()
     job_id = str(int(time.time() * 1000))
 
-    # Creamos la lista de mensajes que se irán llenando
     queue = []
     tasks[job_id] = queue
 

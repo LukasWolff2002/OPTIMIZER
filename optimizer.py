@@ -16,15 +16,16 @@ def optimize():
         max_stops_per_vehicle = data["max_stops"]
         distance_matrix_orig = data["distance_matrix"]
 
-        # Extraer productos únicos
         all_products = set()
         for loc in locations:
             if isinstance(loc.get("demanda"), dict):
                 all_products.update(loc["demanda"].keys())
         all_products = sorted(all_products)
 
-        # 🚀 Subdividir nodos
         subdivided_locations = []
+        split_groups = {}  # Para identificar splits del mismo cliente
+        split_counter = 0
+
         for i, loc in enumerate(locations):
             demanda = loc.get("demanda", {})
             demanda = {k: float(v) for k, v in demanda.items() if float(v) > 0}
@@ -38,15 +39,14 @@ def optimize():
                 })
                 continue
 
-            # Inicializar pendientes
             remaining = demanda.copy()
+            split_indices = []
 
-            # Mientras haya algo que repartir
             while any(qty > 0 for qty in remaining.values()):
                 split = {}
                 total_this_split = 0
                 for product, qty in remaining.items():
-                    if qty > 0:
+                    if qty > 0 and total_this_split < vehicle_capacity:
                         to_take = min(qty, vehicle_capacity - total_this_split)
                         split[product] = to_take
                         remaining[product] -= to_take
@@ -57,8 +57,12 @@ def optimize():
                     "demanda": split,
                     "original_location_index": i
                 })
+                # Guardamos el índice real
+                split_indices.append(len(subdivided_locations) - 1)
 
-        # Construir matriz de distancias entre subdivididos
+            split_groups[i] = split_indices
+
+
         n = len(subdivided_locations)
         distance_matrix = [[0] * n for _ in range(n)]
         for i, from_loc in enumerate(subdivided_locations):
@@ -71,25 +75,26 @@ def optimize():
                     distance_matrix[i][j] = distance_matrix_orig[from_idx][to_idx]
 
         depot = 0
-
         manager = pywrapcp.RoutingIndexManager(n, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
 
-        # Distancia
         def distance_callback(from_index, to_index):
             return distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
         transit_callback_index = routing.RegisterTransitCallback(distance_callback)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-        # Capacidad única: suma todas las demandas por nodo
+        # Capacidad normal por split
         total_demands = []
         for loc in subdivided_locations:
             total = sum(loc["demanda"].values())
             total_demands.append(total)
 
         def demand_callback(from_index):
-            return total_demands[manager.IndexToNode(from_index)]
+            node = manager.IndexToNode(from_index)
+            return total_demands[node]
+
         demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
+
         routing.AddDimensionWithVehicleCapacity(
             demand_callback_index,
             0,
@@ -110,7 +115,19 @@ def optimize():
             "Stops"
         )
 
-        # Parámetros
+        # 🚀 Incompatibilidades entre splits del mismo cliente
+        # Si hay más de un split del mismo cliente, prohibir que un vehículo tome ambos
+        # 🚀 Incompatibilidades estrictas: los splits del mismo cliente deben ir en vehículos diferentes
+        for _, indices in split_groups.items():
+            if len(indices) > 1:
+                for i in indices:
+                    for j in indices:
+                        if i < j:  # Solo una vez por par
+                            idx_i = manager.NodeToIndex(i)
+                            idx_j = manager.NodeToIndex(j)
+                            routing.solver().Add(routing.VehicleVar(idx_i) != routing.VehicleVar(idx_j))
+
+
         search_params = pywrapcp.DefaultRoutingSearchParameters()
         search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_params.time_limit.seconds = 20
@@ -134,7 +151,6 @@ def optimize():
                 ruta.append(node_index)
 
                 delivered_here = {}
-                # Simplemente devolvemos la demanda del nodo
                 for p in all_products:
                     delivered_here[p] = subdivided_locations[node_index]["demanda"].get(p, 0)
 
@@ -149,9 +165,9 @@ def optimize():
                 index = next_index
 
             ruta.append(manager.IndexToNode(index))
-            deliveries.append(vehicle_deliveries)
             if len(ruta) > 2:
                 rutas.append(ruta)
+                deliveries.append(vehicle_deliveries)
 
         return jsonify({
             "used_vehicles": len(rutas),
@@ -164,4 +180,4 @@ def optimize():
         return jsonify(error=f"Error interno: {str(e)}"), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=3000, debug=True)

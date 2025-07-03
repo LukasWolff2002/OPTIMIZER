@@ -1,14 +1,11 @@
 from flask import Flask, request, jsonify, Response
-from flask_cors import CORS
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import json
 import time
 import threading
 
 app = Flask(__name__)
-CORS(app)  # Habilitar CORS para aceptar requests desde cualquier dominio
 
-# Aquí se guardan los progresos por job_id
 tasks = {}
 
 @app.route("/optimize", methods=["POST"])
@@ -34,7 +31,7 @@ def start_optimization():
             distance_matrix = data["distance_matrix"]
 
             if len(vehicle_capacities) != num_vehicles:
-                queue.append(json.dumps({"error": "Cantidad de capacidades no coincide con max_vehicles"}))
+                queue.append(json.dumps({"error": "La cantidad de capacidades no coincide con max_vehicles"}))
                 queue.append("__done__")
                 return
 
@@ -173,4 +170,4 @@ def progress(job_id):
     return Response(generate(), mimetype="text/event-stream")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)

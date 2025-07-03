@@ -1,18 +1,30 @@
-from flask import Flask, request, Response
+from flask import Flask, request, jsonify, Response
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import json
 import time
+import threading
 
 app = Flask(__name__)
 
+# Aquí se guardan los progresos por job_id
+tasks = {}
+
 @app.route("/optimize", methods=["POST"])
-def optimize():
-    def generate():
+def start_optimization():
+    data = request.get_json()
+    job_id = str(int(time.time() * 1000))
+
+    # Creamos la lista de mensajes que se irán llenando
+    queue = []
+    tasks[job_id] = queue
+
+    def worker():
         try:
-            yield "data: [10%] Recibiendo datos...\n\n"
-            data = request.get_json()
+            queue.append("[10%] Recibiendo datos...")
+
             if data is None:
-                yield "data: {\"error\": \"No se recibió JSON válido\"}\n\n"
+                queue.append(json.dumps({"error": "No se recibió JSON válido"}))
+                queue.append("__done__")
                 return
 
             locations = data["locations"]
@@ -21,10 +33,11 @@ def optimize():
             distance_matrix = data["distance_matrix"]
 
             if len(vehicle_capacities) != num_vehicles:
-                yield "data: {\"error\": \"La cantidad de capacidades no coincide con max_vehicles\"}\n\n"
+                queue.append(json.dumps({"error": "Cantidad de capacidades no coincide con max_vehicles"}))
+                queue.append("__done__")
                 return
 
-            yield "data: [20%] Preparando demandas...\n\n"
+            queue.append("[20%] Preparando demandas...")
             num_nodes = len(locations)
             depot = 0
 
@@ -38,11 +51,11 @@ def optimize():
                 total = sum(float(loc.get("demanda", {}).get(p, 0)) for p in all_products)
                 demands.append(int(total))
 
-            yield "data: [30%] Creando modelo...\n\n"
+            queue.append("[30%] Creando modelo...")
             manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
             routing = pywrapcp.RoutingModel(manager)
 
-            yield "data: [40%] Registrando callbacks...\n\n"
+            queue.append("[40%] Registrando callbacks...")
             def distance_callback(from_index, to_index):
                 from_node = manager.IndexToNode(from_index)
                 to_node = manager.IndexToNode(to_index)
@@ -66,7 +79,7 @@ def optimize():
             )
 
             if "max_stops" in data:
-                yield "data: [50%] Añadiendo restricción de máximo paradas...\n\n"
+                queue.append("[50%] Añadiendo restricción de máximo paradas...")
                 max_stops = int(data["max_stops"])
                 def count_callback(from_index):
                     return 1 if manager.IndexToNode(from_index) != depot else 0
@@ -81,7 +94,7 @@ def optimize():
                     "Stops"
                 )
 
-            yield "data: [60%] Configurando parámetros de búsqueda...\n\n"
+            queue.append("[60%] Configurando parámetros de búsqueda...")
             search_parameters = pywrapcp.DefaultRoutingSearchParameters()
             search_parameters.first_solution_strategy = (
                 routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -91,14 +104,15 @@ def optimize():
             )
             search_parameters.time_limit.seconds = 30
 
-            yield "data: [70%] Ejecutando solver...\n\n"
+            queue.append("[70%] Ejecutando solver...")
             solution = routing.SolveWithParameters(search_parameters)
 
             if not solution:
-                yield "data: {\"error\": \"No se pudo encontrar solución.\"}\n\n"
+                queue.append(json.dumps({"error": "No se pudo encontrar solución."}))
+                queue.append("__done__")
                 return
 
-            yield "data: [90%] Procesando resultado...\n\n"
+            queue.append("[90%] Procesando resultado...")
             assignments = []
             total_distance = 0
 
@@ -133,9 +147,27 @@ def optimize():
                 "assignments": assignments
             }
 
-            yield f"data: {json.dumps(result)}\n\n"
+            queue.append(json.dumps(result))
+            queue.append("__done__")
+
         except Exception as e:
-            yield f"data: {{\"error\": \"Error interno: {str(e)}\"}}\n\n"
+            queue.append(json.dumps({"error": f"Error interno: {str(e)}"}))
+            queue.append("__done__")
+
+    threading.Thread(target=worker).start()
+    return jsonify(job_id=job_id)
+
+@app.route("/progress/<job_id>")
+def progress(job_id):
+    def generate():
+        while True:
+            queue = tasks.get(job_id, [])
+            while queue:
+                msg = queue.pop(0)
+                yield f"data: {msg}\n\n"
+                if msg == "__done__":
+                    return
+            time.sleep(0.5)
 
     return Response(generate(), mimetype="text/event-stream")
 

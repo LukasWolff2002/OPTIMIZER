@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from ortools.sat.python import cp_model
 
 app = Flask(__name__)
 
@@ -13,167 +13,106 @@ def optimize():
         locations = data["locations"]
         num_vehicles = data["max_vehicles"]
         vehicle_capacity = data["vehicle_capacity"]
-        max_stops_per_vehicle = data["max_stops"]
-        distance_matrix_orig = data["distance_matrix"]
+        distance_matrix = data["distance_matrix"]
 
+        num_customers = len(locations)
+        depot_index = 0
+
+        # Recolectar lista de todos los productos
         all_products = set()
         for loc in locations:
-            if isinstance(loc.get("demanda"), dict):
-                all_products.update(loc["demanda"].keys())
+            all_products.update(loc.get("demanda", {}).keys())
         all_products = sorted(all_products)
+        num_products = len(all_products)
 
-        subdivided_locations = []
-        split_groups = {}  # Para identificar splits del mismo cliente
-        split_counter = 0
+        # Crear demandas por cliente y producto
+        demands = {}
+        for c, loc in enumerate(locations):
+            for p in all_products:
+                demands[c, p] = int(float(loc.get("demanda", {}).get(p, 0)))
 
-        for i, loc in enumerate(locations):
-            demanda = loc.get("demanda", {})
-            demanda = {k: float(v) for k, v in demanda.items() if float(v) > 0}
+        model = cp_model.CpModel()
 
-            if not demanda:
-                subdivided_locations.append({
-                    "lat": loc["lat"],
-                    "lng": loc["lng"],
-                    "demanda": {},
-                    "original_location_index": i
-                })
-                continue
+        # Variables q[v,c,p]: cantidad de producto p que entrega vehículo v en cliente c
+        q = {}
+        for v in range(num_vehicles):
+            for c in range(1, num_customers):
+                for p in all_products:
+                    q[v, c, p] = model.NewIntVar(0, demands[c, p], f'q_{v}_{c}_{p}')
 
-            remaining = demanda.copy()
-            split_indices = []
+        # Variables x[v,c]: si vehículo v visita cliente c
+        x = {}
+        for v in range(num_vehicles):
+            for c in range(1, num_customers):
+                x[v, c] = model.NewBoolVar(f'x_{v}_{c}')
 
-            while any(qty > 0 for qty in remaining.values()):
-                split = {}
-                total_this_split = 0
-                for product, qty in remaining.items():
-                    if qty > 0 and total_this_split < vehicle_capacity:
-                        to_take = min(qty, vehicle_capacity - total_this_split)
-                        split[product] = to_take
-                        remaining[product] -= to_take
-                        total_this_split += to_take
-                subdivided_locations.append({
-                    "lat": loc["lat"],
-                    "lng": loc["lng"],
-                    "demanda": split,
-                    "original_location_index": i
-                })
-                # Guardamos el índice real
-                split_indices.append(len(subdivided_locations) - 1)
+        big_M = sum(demands[c, p] for c in range(1, num_customers) for p in all_products)
 
-            split_groups[i] = split_indices
+        # Restricción: cada cliente recibe la cantidad completa de cada producto
+        for c in range(1, num_customers):
+            for p in all_products:
+                model.Add(sum(q[v, c, p] for v in range(num_vehicles)) == demands[c, p])
 
+        # Restricción: capacidad por vehículo
+        for v in range(num_vehicles):
+            model.Add(
+                sum(q[v, c, p] for c in range(1, num_customers) for p in all_products)
+                <= vehicle_capacity
+            )
 
-        n = len(subdivided_locations)
-        distance_matrix = [[0] * n for _ in range(n)]
-        for i, from_loc in enumerate(subdivided_locations):
-            for j, to_loc in enumerate(subdivided_locations):
-                if i == j:
-                    distance_matrix[i][j] = 0
-                else:
-                    from_idx = from_loc["original_location_index"]
-                    to_idx = to_loc["original_location_index"]
-                    distance_matrix[i][j] = distance_matrix_orig[from_idx][to_idx]
+        # Restricción: si entrega >0, entonces visita
+        for v in range(num_vehicles):
+            for c in range(1, num_customers):
+                model.Add(
+                    sum(q[v, c, p] for p in all_products) <= big_M * x[v, c]
+                )
 
-        depot = 0
-        manager = pywrapcp.RoutingIndexManager(n, num_vehicles, depot)
-        routing = pywrapcp.RoutingModel(manager)
+        # Objetivo: minimizar distancia depot–cliente–depot
+        total_cost = []
+        for v in range(num_vehicles):
+            for c in range(1, num_customers):
+                cost = distance_matrix[depot_index][c] + distance_matrix[c][depot_index]
+                total_cost.append(cost * x[v, c])
+        model.Minimize(sum(total_cost))
 
-        def distance_callback(from_index, to_index):
-            return distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-        transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+        # Resolver
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 30
+        status = solver.Solve(model)
 
-        # Capacidad normal por split
-        total_demands = []
-        for loc in subdivided_locations:
-            total = sum(loc["demanda"].values())
-            total_demands.append(total)
-
-        def demand_callback(from_index):
-            node = manager.IndexToNode(from_index)
-            return total_demands[node]
-
-        demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-
-        routing.AddDimensionWithVehicleCapacity(
-            demand_callback_index,
-            0,
-            [vehicle_capacity] * num_vehicles,
-            True,
-            "Capacity"
-        )
-
-        # Dimensión de paradas
-        def count_callback(from_index):
-            return 1
-        count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
-        routing.AddDimension(
-            count_callback_index,
-            0,
-            max_stops_per_vehicle,
-            True,
-            "Stops"
-        )
-
-        # 🚀 Incompatibilidades entre splits del mismo cliente
-        # Si hay más de un split del mismo cliente, prohibir que un vehículo tome ambos
-        # 🚀 Incompatibilidades estrictas: los splits del mismo cliente deben ir en vehículos diferentes
-        for _, indices in split_groups.items():
-            if len(indices) > 1:
-                for i in indices:
-                    for j in indices:
-                        if i < j:  # Solo una vez por par
-                            idx_i = manager.NodeToIndex(i)
-                            idx_j = manager.NodeToIndex(j)
-                            routing.solver().Add(routing.VehicleVar(idx_i) != routing.VehicleVar(idx_j))
-
-
-        search_params = pywrapcp.DefaultRoutingSearchParameters()
-        search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-        search_params.time_limit.seconds = 20
-
-        solution = routing.SolveWithParameters(search_params)
-
-        if not solution:
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return jsonify(error="No se pudo encontrar solución."), 400
 
-        total_cost = 0
-        rutas = []
-        deliveries = []
-
+        # Preparar respuesta
+        assignments = []
         for v in range(num_vehicles):
-            index = routing.Start(v)
-            ruta = []
-            vehicle_deliveries = []
-
-            while not routing.IsEnd(index):
-                node_index = manager.IndexToNode(index)
-                ruta.append(node_index)
-
-                delivered_here = {}
-                for p in all_products:
-                    delivered_here[p] = subdivided_locations[node_index]["demanda"].get(p, 0)
-
-                vehicle_deliveries.append({
-                    "location_index": node_index,
-                    "original_location_index": subdivided_locations[node_index]["original_location_index"],
-                    "delivered": delivered_here
+            deliveries = []
+            for c in range(1, num_customers):
+                if solver.Value(x[v, c]):
+                    delivered = {}
+                    total = 0
+                    for p in all_products:
+                        qty = solver.Value(q[v, c, p])
+                        if qty > 0:
+                            delivered[p] = qty
+                            total += qty
+                    if delivered:
+                        deliveries.append({
+                            "client_index": c,
+                            "products": delivered,
+                            "total_quantity": total
+                        })
+            if deliveries:
+                assignments.append({
+                    "vehicle": v,
+                    "deliveries": deliveries
                 })
 
-                next_index = solution.Value(routing.NextVar(index))
-                total_cost += routing.GetArcCostForVehicle(index, next_index, v)
-                index = next_index
-
-            ruta.append(manager.IndexToNode(index))
-            if len(ruta) > 2:
-                rutas.append(ruta)
-                deliveries.append(vehicle_deliveries)
-
         return jsonify({
-            "used_vehicles": len(rutas),
-            "total_cost": total_cost,
-            "routes": rutas,
-            "deliveries": deliveries
+            "status": "success",
+            "total_cost": solver.ObjectiveValue(),
+            "vehicles_used": len(assignments),
+            "assignments": assignments
         })
 
     except Exception as e:

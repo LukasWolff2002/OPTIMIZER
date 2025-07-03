@@ -10,12 +10,12 @@ curl -X POST http://localhost:3000/optimize \
       {
         "lat": -33.4000795,
         "lng": -70.5921517,
-        "demanda": {"A":"100","B":"50"}
+        "demanda": {"A":"100"}
       },
       {
         "lat": -33.357108,
         "lng": -70.514393,
-        "demanda": {"B":"50","C":"50"}
+        "demanda": {"B":"100"}
       },
       {
         "lat": -32.9394663,
@@ -29,8 +29,8 @@ curl -X POST http://localhost:3000/optimize \
       [86,8,0,106],
       [28,102,106,0]
     ],
-    "max_vehicles": 3,
-    "vehicle_capacities": [100,120,80],
-    "vehicle_consumptions": [3.0,2.5,4.0],
+    "max_vehicles": 2,
+    "vehicle_capacities": [100,200],
+    "vehicle_consumptions": [3.0,5.5],
     "max_stops": 5
   }'

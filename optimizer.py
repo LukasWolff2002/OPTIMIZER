@@ -12,20 +12,22 @@ def optimize():
     try:
         locations = data["locations"]
         num_vehicles = data["max_vehicles"]
-        vehicle_capacity = data["vehicle_capacity"]
+        vehicle_capacities = data["vehicle_capacities"]  # 🚀 Lista de capacidades
+        vehicle_consumptions = data["vehicle_consumptions"]  # 🚀 Lista de consumos
         distance_matrix = data["distance_matrix"]
+
+        if len(vehicle_capacities) != num_vehicles or len(vehicle_consumptions) != num_vehicles:
+            return jsonify(error="La cantidad de capacidades o consumos no coincide con max_vehicles"), 400
 
         num_customers = len(locations)
         depot_index = 0
 
-        # Recolectar lista de todos los productos
+        # Lista de productos
         all_products = set()
         for loc in locations:
             all_products.update(loc.get("demanda", {}).keys())
         all_products = sorted(all_products)
-        num_products = len(all_products)
 
-        # Crear demandas por cliente y producto
         demands = {}
         for c, loc in enumerate(locations):
             for p in all_products:
@@ -33,14 +35,12 @@ def optimize():
 
         model = cp_model.CpModel()
 
-        # Variables q[v,c,p]: cantidad de producto p que entrega vehículo v en cliente c
         q = {}
         for v in range(num_vehicles):
             for c in range(1, num_customers):
                 for p in all_products:
                     q[v, c, p] = model.NewIntVar(0, demands[c, p], f'q_{v}_{c}_{p}')
 
-        # Variables x[v,c]: si vehículo v visita cliente c
         x = {}
         for v in range(num_vehicles):
             for c in range(1, num_customers):
@@ -48,34 +48,34 @@ def optimize():
 
         big_M = sum(demands[c, p] for c in range(1, num_customers) for p in all_products)
 
-        # Restricción: cada cliente recibe la cantidad completa de cada producto
+        # Restricción: cada cliente recibe toda su demanda
         for c in range(1, num_customers):
             for p in all_products:
                 model.Add(sum(q[v, c, p] for v in range(num_vehicles)) == demands[c, p])
 
-        # Restricción: capacidad por vehículo
+        # Restricción: cada vehículo respeta su capacidad
         for v in range(num_vehicles):
             model.Add(
                 sum(q[v, c, p] for c in range(1, num_customers) for p in all_products)
-                <= vehicle_capacity
+                <= vehicle_capacities[v]
             )
 
-        # Restricción: si entrega >0, entonces visita
+        # Restricción: si entrega algo, entonces visita
         for v in range(num_vehicles):
             for c in range(1, num_customers):
                 model.Add(
                     sum(q[v, c, p] for p in all_products) <= big_M * x[v, c]
                 )
 
-        # Objetivo: minimizar distancia depot–cliente–depot
+        # Objetivo: minimizar distancia ponderada por consumo
         total_cost = []
         for v in range(num_vehicles):
             for c in range(1, num_customers):
-                cost = distance_matrix[depot_index][c] + distance_matrix[c][depot_index]
+                distance = distance_matrix[depot_index][c] + distance_matrix[c][depot_index]
+                cost = distance * vehicle_consumptions[v]
                 total_cost.append(cost * x[v, c])
         model.Minimize(sum(total_cost))
 
-        # Resolver
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 30
         status = solver.Solve(model)
@@ -83,7 +83,6 @@ def optimize():
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return jsonify(error="No se pudo encontrar solución."), 400
 
-        # Preparar respuesta
         assignments = []
         for v in range(num_vehicles):
             deliveries = []
@@ -105,6 +104,8 @@ def optimize():
             if deliveries:
                 assignments.append({
                     "vehicle": v,
+                    "capacity": vehicle_capacities[v],
+                    "consumption": vehicle_consumptions[v],
                     "deliveries": deliveries
                 })
 

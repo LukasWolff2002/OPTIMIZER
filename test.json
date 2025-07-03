@@ -4,26 +4,33 @@ curl -X POST http://localhost:3000/optimize \
     "locations": [
       {
         "lat": -32.880417,
-        "lng": -71.249463,
+        "lng": -71.24946299999999,
         "demanda": {}
       },
       {
         "lat": -33.4000795,
         "lng": -70.5921517,
-        "demanda": { "A": 50 , "B": 50 }
+        "demanda": {"A":"100","B":"50"}
       },
       {
-        "lat": -33.4000795,
-        "lng": -70.5921517,
-        "demanda": { "A": 100 }
+        "lat": -33.357108,
+        "lng": -70.514393,
+        "demanda": {"B":"50","C":"50"}
+      },
+      {
+        "lat": -32.9394663,
+        "lng": -71.5463031,
+        "demanda": {"C":"50"}
       }
     ],
     "distance_matrix": [
-      [0, 84, 84],
-      [84, 0, 0],
-      [84, 0, 0]
+      [0,84,86,28],
+      [84,0,8,102],
+      [86,8,0,106],
+      [28,102,106,0]
     ],
     "max_vehicles": 3,
-    "vehicle_capacity": 100,
+    "vehicle_capacities": [100,120,80],
+    "vehicle_consumptions": [3.0,2.5,4.0],
     "max_stops": 5
   }'

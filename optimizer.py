@@ -14,7 +14,7 @@ def optimize():
         num_vehicles = data["max_vehicles"]
         vehicle_capacities = data["vehicle_capacities"]
         distance_matrix = data["distance_matrix"]
-        time_matrix = data("time_matrix")  # Puede venir o no
+        time_matrix = data.get("time_matrix")  # Puede venir o no
 
         if len(vehicle_capacities) != num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400

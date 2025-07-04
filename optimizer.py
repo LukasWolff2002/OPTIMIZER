@@ -14,7 +14,7 @@ def optimize():
         num_vehicles = data["max_vehicles"]
         vehicle_capacities = data["vehicle_capacities"]
         distance_matrix = data["distance_matrix"]
-        time_matrix = data.get("time_matrix")  # Puede venir o no
+        time_matrix = data.get("time_matrix")
 
         if len(vehicle_capacities) != num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
@@ -34,10 +34,10 @@ def optimize():
             total = sum(float(loc.get("demanda", {}).get(p, 0)) for p in all_products)
             demands.append(int(total))
 
-        # Create index manager
+        # Index manager
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
 
-        # Create Routing Model
+        # Routing model
         routing = pywrapcp.RoutingModel(manager)
 
         # Callback de distancias
@@ -64,7 +64,7 @@ def optimize():
             "Capacity"
         )
 
-        # Restricción de tiempo total por vehículo (si hay matriz de tiempos)
+        # Restricción y acumulador de tiempo por vehículo
         if time_matrix:
             def time_callback(from_index, to_index):
                 from_node = manager.IndexToNode(from_index)
@@ -75,12 +75,14 @@ def optimize():
 
             routing.AddDimension(
                 time_callback_index,
-                0,          # No slack
-                480,        # 8 horas en minutos
-                True,       # Start cumul to zero
+                0,      # No slack
+                480,    # Máx 8 horas = 480 min
+                True,   # Start cumul to zero
                 "Time"
             )
-
+            time_dimension = routing.GetDimensionOrDie("Time")
+        else:
+            time_dimension = None
 
         # Parámetros de búsqueda
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
@@ -105,6 +107,7 @@ def optimize():
             index = routing.Start(vehicle_id)
             route = []
             deliveries = []
+            route_time = 0
             while not routing.IsEnd(index):
                 node = manager.IndexToNode(index)
                 route.append(node)
@@ -118,11 +121,17 @@ def optimize():
                 index = solution.Value(routing.NextVar(index))
                 total_distance += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
 
+            # Obtener tiempo total de la ruta si hay dimensión de tiempo
+            if time_dimension:
+                cumul = time_dimension.CumulVar(routing.End(vehicle_id))
+                route_time = solution.Value(cumul)
+
             if len(route) > 1:
                 assignments.append({
                     "vehicle": vehicle_id,
                     "route": route + [depot],
-                    "deliveries": deliveries
+                    "deliveries": deliveries,
+                    "total_time_minutes": route_time
                 })
 
         return jsonify({

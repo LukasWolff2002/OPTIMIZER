@@ -14,6 +14,7 @@ def optimize():
         num_vehicles = data["max_vehicles"]
         vehicle_capacities = data["vehicle_capacities"]
         distance_matrix = data["distance_matrix"]
+        time_matrix = data("time_matrix")  # Puede venir o no
 
         if len(vehicle_capacities) != num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
@@ -63,21 +64,23 @@ def optimize():
             "Capacity"
         )
 
-        # Opcional: Restricción de máximo paradas
-        if "max_stops" in data:
-            max_stops = int(data["max_stops"])
-            def count_callback(from_index):
-                return 1 if manager.IndexToNode(from_index) != depot else 0
+        # Restricción de tiempo total por vehículo (si hay matriz de tiempos)
+        if time_matrix:
+            def time_callback(from_index, to_index):
+                from_node = manager.IndexToNode(from_index)
+                to_node = manager.IndexToNode(to_index)
+                return int(time_matrix[from_node][to_node])
 
-            count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
+            time_callback_index = routing.RegisterTransitCallback(time_callback)
 
             routing.AddDimension(
-                count_callback_index,
-                0,
-                max_stops,
-                True,
-                "Stops"
+                time_callback_index,
+                0,          # No slack
+                480,        # 8 horas en minutos
+                True,       # Start cumul to zero
+                "Time"
             )
+
 
         # Parámetros de búsqueda
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()

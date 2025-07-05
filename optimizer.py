@@ -169,8 +169,10 @@ def optimize():
                     original_idx = split_mapping.get(node, node)
                     deliveries.append({
                         "client_index": original_idx,
+                        "node_index": node,
                         "products": delivered
                     })
+
                 previous_index = index
                 index = solution.Value(routing.NextVar(index))
                 dist = extended_distance_matrix[manager.IndexToNode(previous_index)][manager.IndexToNode(index)]

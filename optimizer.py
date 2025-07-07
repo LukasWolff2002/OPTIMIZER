@@ -18,7 +18,7 @@ def optimize():
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
 
-        max_trips_per_vehicle = data.get("max_trips_per_vehicle", 1)
+        max_trips_per_vehicle = 2#data.get("max_trips_per_vehicle", 1)
 
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
@@ -163,6 +163,8 @@ def optimize():
         vehicle_trips = {}
 
         for vehicle_id in range(num_vehicles * max_trips_per_vehicle):
+
+
             index = routing.Start(vehicle_id)
             if routing.IsEnd(index):
                 continue  # este vehículo ficticio no fue usado
@@ -182,8 +184,7 @@ def optimize():
                     delivered = extended_locations[node].get("demanda", {})
                     original_idx = split_mapping.get(node, node)
                     deliveries.append({
-                        "client_index": original_idx,
-                        "node_index": node,
+                        "location_id": extended_locations[node].get("id"),  # Usar el ID real
                         "products": delivered
                     })
 
@@ -242,7 +243,22 @@ def optimize():
             elif cleaned_route[-1] != 0:
                 cleaned_route.append(0)
 
-            trip["route"] = cleaned_route
+            # Convertir los índices de nodos en IDs reales
+            route_with_ids = []
+            for node in cleaned_route:
+                if node == 0:
+                    route_with_ids.append(0)
+                else:
+                    original_idx = split_mapping.get(node, node)
+                    real_id = locations[original_idx]["id"]
+                    route_with_ids.append(real_id)
+
+            trip["route"] = route_with_ids
+
+
+            trip["route"] = route_with_ids
+
+
 
 
         return jsonify({

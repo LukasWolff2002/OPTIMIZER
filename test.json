@@ -2,10 +2,10 @@ curl -X POST http://localhost:3000/optimize \
   -H "Content-Type: application/json" \
   -d '{
     "locations":[
-      {"lat":0,"lng":0,"demanda":{}},
-      {"lat":0,"lng":1,"demanda":{"A":"60"}},
-      {"lat":1,"lng":0,"demanda":{"A":"60"}},
-      {"lat":1,"lng":1,"demanda":{"A":"120"}}
+      {"id": 1, "lat":0,"lng":0,"demanda":{}},
+      {"id": 2, "lat":0,"lng":1,"demanda":{"A":"60"}},
+      {"id": 30, "lat":1,"lng":0,"demanda":{"A":"60"}},
+      {"id": 7, "lat":1,"lng":1,"demanda":{"A":"120"}}
     ],
     "distance_matrix":[
       [0,10,20,30],

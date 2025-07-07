@@ -1,42 +1,20 @@
 from flask import Flask, request, jsonify
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import copy
 
 app = Flask(__name__)
 
-@app.route("/ping")
-def ping():
-    return "pong", 200
-
 @app.route("/optimize", methods=["POST"])
 def optimize():
-    # Importar ortools sólo cuando se necesite
     raw_data = request.get_json()
-    print("========== RAW DATA ==========")
-    print(raw_data)
-    print("================================")
+    if raw_data is None:
+        return jsonify(error="No se recibió JSON válido"), 400
 
-    if raw_data is None or not isinstance(raw_data, list):
-        return jsonify(error="Se esperaba un array JSON con los 3 elementos"), 400
-
-    if len(raw_data) != 3:
-        return jsonify(error="El array debe contener exactamente 3 elementos: datos, trucks_ids, user_id"), 400
-
-    data = raw_data[0]
-    trucks_ids = raw_data[1]
-    user_id = raw_data[2]
-
-    if not isinstance(data, dict):
-        return jsonify(error="El primer elemento debe ser un objeto con los datos de optimización"), 400
-
-    print("========== DATA ==========")
-    print(data)
-    print("================================")
-
-    try:
-        from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-    except Exception as e:
-        import traceback
-        return jsonify(error="Error al importar ortools", detail=str(e), traceback=traceback.format_exc()), 500
+    # Si es array (viene de Sidekiq), tomar el primer elemento
+    if isinstance(raw_data, list):
+        data = raw_data[0]
+    else:
+        data = raw_data
 
     try:
         locations = data["locations"]
@@ -46,16 +24,17 @@ def optimize():
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
 
-        max_trips_per_vehicle = 2
+        max_trips_per_vehicle = 2#data.get("max_trips_per_vehicle", 1)
 
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
         if len(vehicle_consume_base) != base_num_vehicles:
             return jsonify(error="La cantidad de consumos no coincide con max_vehicles"), 400
 
+        # Duplicar vehículos ficticios por viaje
         vehicle_capacities = []
         vehicle_consume = []
-        vehicle_mapping = {}
+        vehicle_mapping = {}  # veh_ficticio -> camion real
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
@@ -67,16 +46,18 @@ def optimize():
         max_vehicle_capacity = max(vehicle_capacities)
         depot = 0
 
+        # Lista de productos
         all_products = set()
         for loc in locations:
             all_products.update(loc.get("demanda", {}).keys())
         all_products = sorted(all_products)
 
+        # Generar nodos extendidos
         extended_locations = []
         extended_demands = []
         split_mapping = {}
 
-        extended_locations.append(locations[0])
+        extended_locations.append(locations[0])  # Depósito
         extended_demands.append(0)
 
         for idx, loc in enumerate(locations[1:], start=1):
@@ -85,7 +66,7 @@ def optimize():
 
             if total_demand <= max_vehicle_capacity:
                 extended_locations.append(loc)
-                extended_demands.append(total_demand)
+                extended_demands.append(int(total_demand))
                 split_mapping[len(extended_locations)-1] = idx
             else:
                 proportions = {p: (q / total_demand) if total_demand > 0 else 0 for p, q in prod_quantities.items()}
@@ -94,8 +75,8 @@ def optimize():
                 while remaining > 0:
                     amount = min(remaining, max_vehicle_capacity)
                     split_loc = copy.deepcopy(loc)
-                    split_demand = {}
 
+                    split_demand = {}
                     if remaining - amount > 0:
                         for p in all_products:
                             q = int(round(amount * proportions[p]))
@@ -106,15 +87,11 @@ def optimize():
 
                     split_loc["demanda"] = {p: str(split_demand[p]) for p in all_products if split_demand[p] > 0}
                     extended_locations.append(split_loc)
-                    extended_demands.append(sum(split_demand.values()))
+                    extended_demands.append(int(sum(split_demand.values())))
                     split_mapping[len(extended_locations)-1] = idx
                     remaining -= amount
 
         num_nodes = len(extended_locations)
-
-        print("extended_distance_matrix:")
-        for r in distance_matrix:
-            print(r)
 
         def extend_matrix(base_matrix):
             new_matrix = [[0]*num_nodes for _ in range(num_nodes)]
@@ -131,13 +108,12 @@ def optimize():
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
 
+        # Costo por vehículo
         for v in range(num_vehicles):
             def make_vehicle_callback(v_idx):
-                return lambda from_index, to_index: max(
-                    1, int(
-                        extended_distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-                        / vehicle_consume[v_idx] * 1000
-                    )
+                return lambda from_index, to_index: int(
+                    extended_distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+                    / vehicle_consume[v_idx] * 1000
                 )
             callback_idx = routing.RegisterTransitCallback(make_vehicle_callback(v))
             routing.SetArcCostEvaluatorOfVehicle(callback_idx, v)
@@ -156,6 +132,7 @@ def optimize():
             "Capacity"
         )
 
+        # Tiempo por viaje
         if extended_time_matrix:
             def time_callback(from_index, to_index):
                 from_node = manager.IndexToNode(from_index)
@@ -166,7 +143,7 @@ def optimize():
             routing.AddDimension(
                 time_callback_index,
                 0,
-                480,
+                480,  # Cada viaje máximo 8 horas
                 True,
                 "Time"
             )
@@ -177,24 +154,29 @@ def optimize():
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        search_parameters.time_limit.seconds = 5
+        search_parameters.time_limit.seconds = 30
 
         solution = routing.SolveWithParameters(search_parameters)
 
         if not solution:
             return jsonify(error="No se pudo encontrar solución."), 400
 
+        # Resultado
+        # Procesar resultado
         assignments = []
         total_distance = 0
         total_fuel_liters = 0.0
         vehicle_trips = {}
 
         for vehicle_id in range(num_vehicles * max_trips_per_vehicle):
+
+
             index = routing.Start(vehicle_id)
             if routing.IsEnd(index):
-                continue
+                continue  # este vehículo ficticio no fue usado
 
             main_vehicle = vehicle_id // max_trips_per_vehicle
+            trip_number = (vehicle_id % max_trips_per_vehicle) + 1
 
             route = []
             deliveries = []
@@ -206,16 +188,14 @@ def optimize():
                 route.append(node)
                 if node != depot:
                     delivered = extended_locations[node].get("demanda", {})
+                    original_idx = split_mapping.get(node, node)
                     deliveries.append({
-                        "location_id": extended_locations[node].get("id"),
+                        "location_id": extended_locations[node].get("id"),  # Usar el ID real
                         "products": delivered
                     })
 
                 previous_index = index
                 index = solution.Value(routing.NextVar(index))
-                if index < 0 or index >= routing.Size():
-                    raise ValueError(f"Índice fuera de rango: {index}")
-
                 dist = extended_distance_matrix[manager.IndexToNode(previous_index)][manager.IndexToNode(index)]
                 distance_vehicle += dist
                 total_distance += dist
@@ -237,6 +217,7 @@ def optimize():
                     "fuel_liters": 0.0
                 }
 
+            # Concatenar rutas y entregas
             vehicle_trips[main_vehicle]["route"].extend(route + [depot])
             vehicle_trips[main_vehicle]["deliveries"].extend(deliveries)
             vehicle_trips[main_vehicle]["total_time_minutes"] += route_time
@@ -245,23 +226,48 @@ def optimize():
 
         assignments = list(vehicle_trips.values())
 
-        # Limpiar rutas
+        # Limpiar rutas de depósitos duplicados
+        # Limpiar rutas: evitar depósitos duplicados y asegurar terminación en depósito
+        # Limpiar rutas y convertir a IDs reales
         for trip in assignments:
             raw_route = trip.get("route", [])
+            if not isinstance(raw_route, list):
+                raw_route = []
+
             cleaned_route = []
             prev = None
             for node in raw_route:
-                if node == 0 and prev == 0:
-                    continue
+                if node == 0:
+                    if prev == 0:
+                        continue
                 cleaned_route.append(node)
                 prev = node
 
             if len(cleaned_route) == 0:
                 cleaned_route = [0, 0]
+            elif cleaned_route == [0]:
+                cleaned_route = [0, 0]
             elif cleaned_route[-1] != 0:
                 cleaned_route.append(0)
 
-            trip["route"] = [extended_locations[node].get("id") if node != 0 else 0 for node in cleaned_route]
+            # Convertir índices extendidos a IDs reales
+            route_with_ids = []
+            for node in cleaned_route:
+                if node == 0:
+                    route_with_ids.append(0)
+                else:
+                    # Usar split_mapping si existe, o fallback idx directo
+                    mapped_idx = split_mapping.get(node, node)
+                    real_id = extended_locations[node].get("id")
+                    if real_id is None:
+                        real_id = locations[mapped_idx]["id"]
+                    route_with_ids.append(real_id)
+
+            trip["route"] = route_with_ids
+
+
+
+
 
         return jsonify({
             "status": "success",
@@ -271,19 +277,9 @@ def optimize():
             "assignments": assignments
         })
 
-    except Exception as e:
-        import traceback
-        return jsonify(error=f"Error interno: {str(e)}", traceback=traceback.format_exc()), 500
 
-
-@app.route("/test_ortools")
-def test_ortools():
-    try:
-        from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-        return "ORTools import ok", 200
     except Exception as e:
-        import traceback
-        return jsonify(error="Import failed", detail=str(e), traceback=traceback.format_exc()), 500
+        return jsonify(error=f"Error interno: {str(e)}"), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=3000, debug=False)

@@ -1,5 +1,5 @@
-curl https://optimizer-production-adc0.up.railway.app/ping \
- -H "Content-Type: application/json" \
+curl -X POST http://localhost:3000/optimize \
+  -H "Content-Type: application/json" \
   -d '[
     {
       "locations": [

@@ -30,7 +30,12 @@ def optimize():
     print(data)
     print("================================")
 
-    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+    try:
+        from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+    except Exception as e:
+        import traceback
+        return jsonify(error="Error al importar ortools", detail=str(e), traceback=traceback.format_exc()), 500
+
 
     try:
         locations = data["locations"]

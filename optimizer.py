@@ -1,11 +1,18 @@
 from flask import Flask, request, jsonify
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import copy
 
 app = Flask(__name__)
 
+# Endpoint simple para mantener el servidor despierto
+@app.route("/ping")
+def ping():
+    return "pong", 200
+
 @app.route("/optimize", methods=["POST"])
 def optimize():
+    # Importar ortools sólo cuando se necesite
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
     raw_data = request.get_json()
     print("========== RAW DATA ==========")
     print(raw_data)
@@ -31,7 +38,7 @@ def optimize():
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
 
-        max_trips_per_vehicle = 2#data.get("max_trips_per_vehicle", 1)
+        max_trips_per_vehicle = 2  # Puedes parametrizarlo si quieres
 
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
@@ -41,7 +48,7 @@ def optimize():
         # Duplicar vehículos ficticios por viaje
         vehicle_capacities = []
         vehicle_consume = []
-        vehicle_mapping = {}  # veh_ficticio -> camion real
+        vehicle_mapping = {}
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
@@ -53,18 +60,16 @@ def optimize():
         max_vehicle_capacity = max(vehicle_capacities)
         depot = 0
 
-        # Lista de productos
         all_products = set()
         for loc in locations:
             all_products.update(loc.get("demanda", {}).keys())
         all_products = sorted(all_products)
 
-        # Generar nodos extendidos
         extended_locations = []
         extended_demands = []
         split_mapping = {}
 
-        extended_locations.append(locations[0])  # Depósito
+        extended_locations.append(locations[0])
         extended_demands.append(0)
 
         for idx, loc in enumerate(locations[1:], start=1):
@@ -73,7 +78,7 @@ def optimize():
 
             if total_demand <= max_vehicle_capacity:
                 extended_locations.append(loc)
-                extended_demands.append(int(total_demand))
+                extended_demands.append(total_demand)
                 split_mapping[len(extended_locations)-1] = idx
             else:
                 proportions = {p: (q / total_demand) if total_demand > 0 else 0 for p, q in prod_quantities.items()}
@@ -82,8 +87,8 @@ def optimize():
                 while remaining > 0:
                     amount = min(remaining, max_vehicle_capacity)
                     split_loc = copy.deepcopy(loc)
-
                     split_demand = {}
+
                     if remaining - amount > 0:
                         for p in all_products:
                             q = int(round(amount * proportions[p]))
@@ -94,7 +99,7 @@ def optimize():
 
                     split_loc["demanda"] = {p: str(split_demand[p]) for p in all_products if split_demand[p] > 0}
                     extended_locations.append(split_loc)
-                    extended_demands.append(int(sum(split_demand.values())))
+                    extended_demands.append(sum(split_demand.values()))
                     split_mapping[len(extended_locations)-1] = idx
                     remaining -= amount
 
@@ -115,7 +120,6 @@ def optimize():
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
 
-        # Costo por vehículo
         for v in range(num_vehicles):
             def make_vehicle_callback(v_idx):
                 return lambda from_index, to_index: int(
@@ -139,7 +143,6 @@ def optimize():
             "Capacity"
         )
 
-        # Tiempo por viaje
         if extended_time_matrix:
             def time_callback(from_index, to_index):
                 from_node = manager.IndexToNode(from_index)
@@ -150,7 +153,7 @@ def optimize():
             routing.AddDimension(
                 time_callback_index,
                 0,
-                480,  # Cada viaje máximo 8 horas
+                480,
                 True,
                 "Time"
             )
@@ -168,19 +171,15 @@ def optimize():
         if not solution:
             return jsonify(error="No se pudo encontrar solución."), 400
 
-        # Resultado
-        # Procesar resultado
         assignments = []
         total_distance = 0
         total_fuel_liters = 0.0
         vehicle_trips = {}
 
         for vehicle_id in range(num_vehicles * max_trips_per_vehicle):
-
-
             index = routing.Start(vehicle_id)
             if routing.IsEnd(index):
-                continue  # este vehículo ficticio no fue usado
+                continue
 
             main_vehicle = vehicle_id // max_trips_per_vehicle
             trip_number = (vehicle_id % max_trips_per_vehicle) + 1
@@ -195,9 +194,8 @@ def optimize():
                 route.append(node)
                 if node != depot:
                     delivered = extended_locations[node].get("demanda", {})
-                    original_idx = split_mapping.get(node, node)
                     deliveries.append({
-                        "location_id": extended_locations[node].get("id"),  # Usar el ID real
+                        "location_id": extended_locations[node].get("id"),
                         "products": delivered
                     })
 
@@ -224,7 +222,6 @@ def optimize():
                     "fuel_liters": 0.0
                 }
 
-            # Concatenar rutas y entregas
             vehicle_trips[main_vehicle]["route"].extend(route + [depot])
             vehicle_trips[main_vehicle]["deliveries"].extend(deliveries)
             vehicle_trips[main_vehicle]["total_time_minutes"] += route_time
@@ -233,48 +230,23 @@ def optimize():
 
         assignments = list(vehicle_trips.values())
 
-        # Limpiar rutas de depósitos duplicados
-        # Limpiar rutas: evitar depósitos duplicados y asegurar terminación en depósito
-        # Limpiar rutas y convertir a IDs reales
+        # Limpiar rutas
         for trip in assignments:
             raw_route = trip.get("route", [])
-            if not isinstance(raw_route, list):
-                raw_route = []
-
             cleaned_route = []
             prev = None
             for node in raw_route:
-                if node == 0:
-                    if prev == 0:
-                        continue
+                if node == 0 and prev == 0:
+                    continue
                 cleaned_route.append(node)
                 prev = node
 
             if len(cleaned_route) == 0:
                 cleaned_route = [0, 0]
-            elif cleaned_route == [0]:
-                cleaned_route = [0, 0]
             elif cleaned_route[-1] != 0:
                 cleaned_route.append(0)
 
-            # Convertir índices extendidos a IDs reales
-            route_with_ids = []
-            for node in cleaned_route:
-                if node == 0:
-                    route_with_ids.append(0)
-                else:
-                    # Usar split_mapping si existe, o fallback idx directo
-                    mapped_idx = split_mapping.get(node, node)
-                    real_id = extended_locations[node].get("id")
-                    if real_id is None:
-                        real_id = locations[mapped_idx]["id"]
-                    route_with_ids.append(real_id)
-
-            trip["route"] = route_with_ids
-
-
-
-
+            trip["route"] = [extended_locations[node].get("id") if node != 0 else 0 for node in cleaned_route]
 
         return jsonify({
             "status": "success",
@@ -284,9 +256,8 @@ def optimize():
             "assignments": assignments
         })
 
-
     except Exception as e:
         return jsonify(error=f"Error interno: {str(e)}"), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    app.run(host="0.0.0.0", port=3000, debug=True)

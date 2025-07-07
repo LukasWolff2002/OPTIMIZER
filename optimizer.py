@@ -216,14 +216,25 @@ def optimize():
                 }
 
             # Convertir índices a IDs
-            trip_route = [extended_locations[n].get("id") if n != 0 else 0 for n in route + [0]]
+            # Convertir índices a IDs reales
+            trip_route_raw = [0] + [extended_locations[n].get("id") if n != 0 else 0 for n in route] + [0]
 
-            # Si ya tiene rutas previas, quitar el depósito inicial (0) del nuevo viaje
+            # Eliminar ceros duplicados consecutivos
+            cleaned_trip_route = []
+            prev = None
+            for node in trip_route_raw:
+                if node == 0 and prev == 0:
+                    continue
+                cleaned_trip_route.append(node)
+                prev = node
+
+            # Si ya hay rutas previas, quitar el primer 0 del nuevo tramo para no repetir
             if vehicle_trips[main_vehicle]["route"]:
-                if trip_route[0] == 0:
-                    trip_route = trip_route[1:]
+                if cleaned_trip_route[0] == 0:
+                    cleaned_trip_route = cleaned_trip_route[1:]
 
-            vehicle_trips[main_vehicle]["route"].extend(trip_route)
+            vehicle_trips[main_vehicle]["route"].extend(cleaned_trip_route)
+
 
             vehicle_trips[main_vehicle]["deliveries"].extend(deliveries)
             vehicle_trips[main_vehicle]["total_time_minutes"] += route_time

@@ -1,18 +1,26 @@
 curl -X POST http://localhost:3000/optimize \
   -H "Content-Type: application/json" \
   -d '{
-    "locations": [
-      { "lat": -32.880417, "lng": -71.2494629, "demanda": {} },
-      { "lat": -33.4000795, "lng": -70.5921517, "demanda": { "Caja Cherry 500 grs": "120" } }
+    "locations":[
+      {"lat":0,"lng":0,"demanda":{}},
+      {"lat":0,"lng":1,"demanda":{"A":"60"}},
+      {"lat":1,"lng":0,"demanda":{"A":"60"}},
+      {"lat":1,"lng":1,"demanda":{"A":"120"}}
     ],
-    "distance_matrix": [
-      [0,120],
-      [120,0]
+    "distance_matrix":[
+      [0,10,20,30],
+      [10,0,15,25],
+      [20,15,0,35],
+      [30,25,35,0]
     ],
-    "time_matrix": [
-      [0,100],
-      [100,0]
+    "time_matrix":[
+      [0,10,20,30],
+      [10,0,15,25],
+      [20,15,0,35],
+      [30,25,35,0]
     ],
-    "max_vehicles": 2,
-    "vehicle_capacities": [80,50]
+    "max_vehicles":2,
+    "vehicle_capacities":[100,100],
+    "vehicle_consume":[2.0,0.1],
+    "max_trips_per_vehicle":2
   }'

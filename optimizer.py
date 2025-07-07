@@ -11,7 +11,7 @@ def ping():
 @app.route("/optimize", methods=["POST"])
 def optimize():
     # Importar ortools sólo cuando se necesite
-    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+    
 
     raw_data = request.get_json()
     print("========== RAW DATA ==========")
@@ -29,6 +29,8 @@ def optimize():
     print("========== DATA ==========")
     print(data)
     print("================================")
+
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
     try:
         locations = data["locations"]

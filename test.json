@@ -1,25 +1,23 @@
-curl -X POST http://localhost:3000/optimize \
-  -H "Content-Type: application/json" \
-  -d '{
-    "locations":[
-      {"id": 1, "lat":0,"lng":0,"demanda":{}},
-      {"id": 2, "lat":0,"lng":1,"demanda":{"A":"60"}},
-      {"id": 30, "lat":1,"lng":0,"demanda":{"A":"60"}},
-      {"id": 7, "lat":1,"lng":1,"demanda":{"A":"120"}}
-    ],
-    "distance_matrix":[
-      [0,10,20,30],
-      [10,0,15,25],
-      [20,15,0,35],
-      [30,25,35,0]
-    ],
-    "time_matrix":[
-      [0,10,20,30],
-      [10,0,15,25],
-      [20,15,0,35],
-      [30,25,35,0]
-    ],
-    "max_vehicles":2,
-    "vehicle_capacities":[100,100],
-    "vehicle_consume":[2.0,0.1]
-  }'
+curl https://optimizer-production-adc0.up.railway.app/ping \
+ -H "Content-Type: application/json" \
+  -d '[
+    {
+      "locations": [
+        {"id": 1, "lat": 0, "lng": 0, "demanda": {}},
+        {"id": 2, "lat": 0, "lng": 1, "demanda": {"A": "125"}}
+      ],
+      "distance_matrix": [
+        [0, 1],
+        [1, 0]
+      ],
+      "time_matrix": [
+        [0, 8.6],
+        [8.5, 0]
+      ],
+      "max_vehicles": 1,
+      "vehicle_capacities": [100],
+      "vehicle_consume": [10.0]
+    },
+    [1],
+    1
+  ]'

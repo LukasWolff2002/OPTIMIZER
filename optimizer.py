@@ -10,7 +10,7 @@ def optimize():
     if raw_data is None:
         return jsonify(error="No se recibió JSON válido"), 400
 
-    
+    # Si es array (viene de Sidekiq), tomar el primer elemento
     if isinstance(raw_data, list):
         data = raw_data[0]
     else:

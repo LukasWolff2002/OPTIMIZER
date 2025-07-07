@@ -215,9 +215,16 @@ def optimize():
                     "fuel_liters": 0.0
                 }
 
-            vehicle_trips[main_vehicle]["route"].extend(
-                [extended_locations[n].get("id") if n != 0 else 0 for n in route + [0]]
-            )
+            # Convertir índices a IDs
+            trip_route = [extended_locations[n].get("id") if n != 0 else 0 for n in route + [0]]
+
+            # Si ya tiene rutas previas, quitar el depósito inicial (0) del nuevo viaje
+            if vehicle_trips[main_vehicle]["route"]:
+                if trip_route[0] == 0:
+                    trip_route = trip_route[1:]
+
+            vehicle_trips[main_vehicle]["route"].extend(trip_route)
+
             vehicle_trips[main_vehicle]["deliveries"].extend(deliveries)
             vehicle_trips[main_vehicle]["total_time_minutes"] += route_time
             vehicle_trips[main_vehicle]["total_distance"] += distance_vehicle

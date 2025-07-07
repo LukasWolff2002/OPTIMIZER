@@ -3,7 +3,6 @@ import copy
 
 app = Flask(__name__)
 
-# Endpoint simple para mantener el servidor despierto
 @app.route("/ping")
 def ping():
     return "pong", 200
@@ -11,20 +10,23 @@ def ping():
 @app.route("/optimize", methods=["POST"])
 def optimize():
     # Importar ortools sólo cuando se necesite
-    
-
     raw_data = request.get_json()
     print("========== RAW DATA ==========")
     print(raw_data)
     print("================================")
-    if raw_data is None:
-        return jsonify(error="No se recibió JSON válido"), 400
 
-    # Si es array (viene de Sidekiq), tomar el primer elemento
-    if isinstance(raw_data, list):
-        data = raw_data[0]
-    else:
-        data = raw_data
+    if raw_data is None or not isinstance(raw_data, list):
+        return jsonify(error="Se esperaba un array JSON con los 3 elementos"), 400
+
+    if len(raw_data) != 3:
+        return jsonify(error="El array debe contener exactamente 3 elementos: datos, trucks_ids, user_id"), 400
+
+    data = raw_data[0]
+    trucks_ids = raw_data[1]
+    user_id = raw_data[2]
+
+    if not isinstance(data, dict):
+        return jsonify(error="El primer elemento debe ser un objeto con los datos de optimización"), 400
 
     print("========== DATA ==========")
     print(data)
@@ -36,7 +38,6 @@ def optimize():
         import traceback
         return jsonify(error="Error al importar ortools", detail=str(e), traceback=traceback.format_exc()), 500
 
-
     try:
         locations = data["locations"]
         base_num_vehicles = data["max_vehicles"]
@@ -45,14 +46,13 @@ def optimize():
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
 
-        max_trips_per_vehicle = 2  # Puedes parametrizarlo si quieres
+        max_trips_per_vehicle = 2
 
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
         if len(vehicle_consume_base) != base_num_vehicles:
             return jsonify(error="La cantidad de consumos no coincide con max_vehicles"), 400
 
-        # Duplicar vehículos ficticios por viaje
         vehicle_capacities = []
         vehicle_consume = []
         vehicle_mapping = {}
@@ -112,6 +112,10 @@ def optimize():
 
         num_nodes = len(extended_locations)
 
+        print("extended_distance_matrix:")
+        for r in distance_matrix:
+            print(r)
+
         def extend_matrix(base_matrix):
             new_matrix = [[0]*num_nodes for _ in range(num_nodes)]
             for i in range(num_nodes):
@@ -129,9 +133,11 @@ def optimize():
 
         for v in range(num_vehicles):
             def make_vehicle_callback(v_idx):
-                return lambda from_index, to_index: int(
-                    extended_distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-                    / vehicle_consume[v_idx] * 1000
+                return lambda from_index, to_index: max(
+                    1, int(
+                        extended_distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+                        / vehicle_consume[v_idx] * 1000
+                    )
                 )
             callback_idx = routing.RegisterTransitCallback(make_vehicle_callback(v))
             routing.SetArcCostEvaluatorOfVehicle(callback_idx, v)
@@ -189,7 +195,6 @@ def optimize():
                 continue
 
             main_vehicle = vehicle_id // max_trips_per_vehicle
-            trip_number = (vehicle_id % max_trips_per_vehicle) + 1
 
             route = []
             deliveries = []
@@ -208,6 +213,9 @@ def optimize():
 
                 previous_index = index
                 index = solution.Value(routing.NextVar(index))
+                if index < 0 or index >= routing.Size():
+                    raise ValueError(f"Índice fuera de rango: {index}")
+
                 dist = extended_distance_matrix[manager.IndexToNode(previous_index)][manager.IndexToNode(index)]
                 distance_vehicle += dist
                 total_distance += dist
@@ -264,7 +272,9 @@ def optimize():
         })
 
     except Exception as e:
-        return jsonify(error=f"Error interno: {str(e)}"), 500
+        import traceback
+        return jsonify(error=f"Error interno: {str(e)}", traceback=traceback.format_exc()), 500
+
 
 @app.route("/test_ortools")
 def test_ortools():
@@ -274,7 +284,6 @@ def test_ortools():
     except Exception as e:
         import traceback
         return jsonify(error="Import failed", detail=str(e), traceback=traceback.format_exc()), 500
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)

@@ -266,5 +266,15 @@ def optimize():
     except Exception as e:
         return jsonify(error=f"Error interno: {str(e)}"), 500
 
+@app.route("/test_ortools")
+def test_ortools():
+    try:
+        from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+        return "ORTools import ok", 200
+    except Exception as e:
+        import traceback
+        return jsonify(error="Import failed", detail=str(e), traceback=traceback.format_exc()), 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)

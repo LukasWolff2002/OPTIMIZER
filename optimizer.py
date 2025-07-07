@@ -10,11 +10,17 @@ def optimize():
     if raw_data is None:
         return jsonify(error="No se recibió JSON válido"), 400
 
-    # Si es array (viene de Sidekiq), tomar el primer elemento
+    # Si es array (viene de Sidekiq), tomar los 3 elementos
     if isinstance(raw_data, list):
+        if len(raw_data) != 3:
+            return jsonify(error="Se esperaba un array de 3 elementos: [data, truck_ids, user_id]"), 400
         data = raw_data[0]
+        truck_ids = raw_data[1]
+        user_id = raw_data[2]
     else:
         data = raw_data
+        truck_ids = []
+        user_id = None
 
     try:
         locations = data["locations"]
@@ -23,8 +29,7 @@ def optimize():
         vehicle_consume_base = data.get("vehicle_consume", [1]*base_num_vehicles)
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
-
-        max_trips_per_vehicle = 2#data.get("max_trips_per_vehicle", 1)
+        max_trips_per_vehicle = 2
 
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
@@ -34,7 +39,7 @@ def optimize():
         # Duplicar vehículos ficticios por viaje
         vehicle_capacities = []
         vehicle_consume = []
-        vehicle_mapping = {}  # veh_ficticio -> camion real
+        vehicle_mapping = {}
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
@@ -53,12 +58,9 @@ def optimize():
         all_products = sorted(all_products)
 
         # Generar nodos extendidos
-        extended_locations = []
-        extended_demands = []
+        extended_locations = [locations[0]]  # Depósito
+        extended_demands = [0]
         split_mapping = {}
-
-        extended_locations.append(locations[0])  # Depósito
-        extended_demands.append(0)
 
         for idx, loc in enumerate(locations[1:], start=1):
             prod_quantities = {p: int(float(loc.get("demanda", {}).get(p, 0))) for p in all_products}
@@ -69,14 +71,14 @@ def optimize():
                 extended_demands.append(int(total_demand))
                 split_mapping[len(extended_locations)-1] = idx
             else:
-                proportions = {p: (q / total_demand) if total_demand > 0 else 0 for p, q in prod_quantities.items()}
+                proportions = {p: (q / total_demand) for p, q in prod_quantities.items()}
                 remaining = total_demand
                 remaining_per_product = prod_quantities.copy()
                 while remaining > 0:
                     amount = min(remaining, max_vehicle_capacity)
                     split_loc = copy.deepcopy(loc)
-
                     split_demand = {}
+
                     if remaining - amount > 0:
                         for p in all_products:
                             q = int(round(amount * proportions[p]))
@@ -108,7 +110,6 @@ def optimize():
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
 
-        # Costo por vehículo
         for v in range(num_vehicles):
             def make_vehicle_callback(v_idx):
                 return lambda from_index, to_index: int(
@@ -132,7 +133,6 @@ def optimize():
             "Capacity"
         )
 
-        # Tiempo por viaje
         if extended_time_matrix:
             def time_callback(from_index, to_index):
                 from_node = manager.IndexToNode(from_index)
@@ -143,7 +143,7 @@ def optimize():
             routing.AddDimension(
                 time_callback_index,
                 0,
-                480,  # Cada viaje máximo 8 horas
+                480,
                 True,
                 "Time"
             )
@@ -161,36 +161,29 @@ def optimize():
         if not solution:
             return jsonify(error="No se pudo encontrar solución."), 400
 
-        # Resultado
-        # Procesar resultado
         assignments = []
         total_distance = 0
         total_fuel_liters = 0.0
         vehicle_trips = {}
 
-        for vehicle_id in range(num_vehicles * max_trips_per_vehicle):
-
-
+        for vehicle_id in range(num_vehicles):
             index = routing.Start(vehicle_id)
             if routing.IsEnd(index):
-                continue  # este vehículo ficticio no fue usado
+                continue
 
             main_vehicle = vehicle_id // max_trips_per_vehicle
-            trip_number = (vehicle_id % max_trips_per_vehicle) + 1
-
             route = []
             deliveries = []
-            route_time = 0
             distance_vehicle = 0.0
+            route_time = 0
 
             while not routing.IsEnd(index):
                 node = manager.IndexToNode(index)
                 route.append(node)
                 if node != depot:
                     delivered = extended_locations[node].get("demanda", {})
-                    original_idx = split_mapping.get(node, node)
                     deliveries.append({
-                        "location_id": extended_locations[node].get("id"),  # Usar el ID real
+                        "location_id": extended_locations[node].get("id"),
                         "products": delivered
                     })
 
@@ -207,79 +200,26 @@ def optimize():
                 cumul = time_dimension.CumulVar(routing.End(vehicle_id))
                 route_time = solution.Value(cumul)
 
-            if main_vehicle not in vehicle_trips:
-                vehicle_trips[main_vehicle] = {
-                    "vehicle": main_vehicle,
-                    "route": [],
-                    "deliveries": [],
-                    "total_time_minutes": 0,
-                    "total_distance": 0.0,
-                    "fuel_liters": 0.0
-                }
-
-            # Concatenar rutas y entregas
-            vehicle_trips[main_vehicle]["route"].extend(route + [depot])
-            vehicle_trips[main_vehicle]["deliveries"].extend(deliveries)
-            vehicle_trips[main_vehicle]["total_time_minutes"] += route_time
-            vehicle_trips[main_vehicle]["total_distance"] += distance_vehicle
-            vehicle_trips[main_vehicle]["fuel_liters"] += fuel_liters
-
-        assignments = list(vehicle_trips.values())
-
-        # Limpiar rutas de depósitos duplicados
-        # Limpiar rutas: evitar depósitos duplicados y asegurar terminación en depósito
-        # Limpiar rutas y convertir a IDs reales
-        for trip in assignments:
-            raw_route = trip.get("route", [])
-            if not isinstance(raw_route, list):
-                raw_route = []
-
-            cleaned_route = []
-            prev = None
-            for node in raw_route:
-                if node == 0:
-                    if prev == 0:
-                        continue
-                cleaned_route.append(node)
-                prev = node
-
-            if len(cleaned_route) == 0:
-                cleaned_route = [0, 0]
-            elif cleaned_route == [0]:
-                cleaned_route = [0, 0]
-            elif cleaned_route[-1] != 0:
-                cleaned_route.append(0)
-
-            # Convertir índices extendidos a IDs reales
-            route_with_ids = []
-            for node in cleaned_route:
-                if node == 0:
-                    route_with_ids.append(0)
-                else:
-                    # Usar split_mapping si existe, o fallback idx directo
-                    mapped_idx = split_mapping.get(node, node)
-                    real_id = extended_locations[node].get("id")
-                    if real_id is None:
-                        real_id = locations[mapped_idx]["id"]
-                    route_with_ids.append(real_id)
-
-            trip["route"] = route_with_ids
-
-
-
-
+            vehicle_trips[main_vehicle] = {
+                "vehicle": main_vehicle,
+                "route": [extended_locations[n].get("id") if n != 0 else 0 for n in route + [0]],
+                "deliveries": deliveries,
+                "total_time_minutes": route_time,
+                "total_distance": distance_vehicle,
+                "fuel_liters": fuel_liters
+            }
 
         return jsonify({
             "status": "success",
             "total_distance": total_distance,
             "total_fuel_liters": round(total_fuel_liters, 2),
-            "vehicles_used": len(assignments),
-            "assignments": assignments
+            "vehicles_used": len(vehicle_trips),
+            "assignments": list(vehicle_trips.values())
         })
 
-
     except Exception as e:
-        return jsonify(error=f"Error interno: {str(e)}"), 500
+        import traceback
+        return jsonify(error=f"Error interno: {str(e)}", traceback=traceback.format_exc()), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=3000, debug=False)

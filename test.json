@@ -21,6 +21,5 @@ curl -X POST http://localhost:3000/optimize \
     ],
     "max_vehicles":2,
     "vehicle_capacities":[100,100],
-    "vehicle_consume":[2.0,0.1],
-    "max_trips_per_vehicle":2
+    "vehicle_consume":[2.0,0.1]
   }'

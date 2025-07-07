@@ -222,6 +222,7 @@ def optimize():
 
         # Limpiar rutas de depósitos duplicados
         # Limpiar rutas: evitar depósitos duplicados y asegurar terminación en depósito
+        # Limpiar rutas y convertir a IDs reales
         for trip in assignments:
             raw_route = trip.get("route", [])
             if not isinstance(raw_route, list):
@@ -237,26 +238,27 @@ def optimize():
                 prev = node
 
             if len(cleaned_route) == 0:
-                cleaned_route = [0,0]
+                cleaned_route = [0, 0]
             elif cleaned_route == [0]:
-                cleaned_route = [0,0]
+                cleaned_route = [0, 0]
             elif cleaned_route[-1] != 0:
                 cleaned_route.append(0)
 
-            # Convertir los índices de nodos en IDs reales
+            # Convertir índices extendidos a IDs reales
             route_with_ids = []
             for node in cleaned_route:
                 if node == 0:
                     route_with_ids.append(0)
                 else:
-                    original_idx = split_mapping.get(node, node)
-                    real_id = locations[original_idx]["id"]
+                    # Usar split_mapping si existe, o fallback idx directo
+                    mapped_idx = split_mapping.get(node, node)
+                    real_id = extended_locations[node].get("id")
+                    if real_id is None:
+                        real_id = locations[mapped_idx]["id"]
                     route_with_ids.append(real_id)
 
             trip["route"] = route_with_ids
 
-
-            trip["route"] = route_with_ids
 
 
 
@@ -274,4 +276,4 @@ def optimize():
         return jsonify(error=f"Error interno: {str(e)}"), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=3000, debug=False)

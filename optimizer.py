@@ -7,6 +7,9 @@ app = Flask(__name__)
 @app.route("/optimize", methods=["POST"])
 def optimize():
     raw_data = request.get_json()
+    print("========== RAW DATA ==========")
+    print(raw_data)
+    print("================================")
     if raw_data is None:
         return jsonify(error="No se recibió JSON válido"), 400
 
@@ -15,6 +18,10 @@ def optimize():
         data = raw_data[0]
     else:
         data = raw_data
+
+    print("========== DATA ==========")
+    print(data)
+    print("================================")
 
     try:
         locations = data["locations"]
@@ -282,4 +289,4 @@ def optimize():
         return jsonify(error=f"Error interno: {str(e)}"), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False)

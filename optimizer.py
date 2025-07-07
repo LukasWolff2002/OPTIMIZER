@@ -29,14 +29,14 @@ def optimize():
         vehicle_consume_base = data.get("vehicle_consume", [1]*base_num_vehicles)
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
-        max_trips_per_vehicle = 2
+        max_trips_per_vehicle = 2  # ✅ Permitir múltiples viajes
 
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
         if len(vehicle_consume_base) != base_num_vehicles:
             return jsonify(error="La cantidad de consumos no coincide con max_vehicles"), 400
 
-        # Duplicar vehículos ficticios por viaje
+        # ✅ Duplicar vehículos ficticios por viaje
         vehicle_capacities = []
         vehicle_consume = []
         vehicle_mapping = {}
@@ -58,7 +58,7 @@ def optimize():
         all_products = sorted(all_products)
 
         # Generar nodos extendidos
-        extended_locations = [locations[0]]  # Depósito
+        extended_locations = [locations[0]]
         extended_demands = [0]
         split_mapping = {}
 
@@ -110,6 +110,7 @@ def optimize():
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
 
+        # Callback de coste
         for v in range(num_vehicles):
             def make_vehicle_callback(v_idx):
                 return lambda from_index, to_index: int(
@@ -119,6 +120,7 @@ def optimize():
             callback_idx = routing.RegisterTransitCallback(make_vehicle_callback(v))
             routing.SetArcCostEvaluatorOfVehicle(callback_idx, v)
 
+        # Callback de demanda
         def demand_callback(from_index):
             node = manager.IndexToNode(from_index)
             return extended_demands[node]
@@ -133,6 +135,7 @@ def optimize():
             "Capacity"
         )
 
+        # Tiempo
         if extended_time_matrix:
             def time_callback(from_index, to_index):
                 from_node = manager.IndexToNode(from_index)
@@ -151,6 +154,7 @@ def optimize():
         else:
             time_dimension = None
 
+        # Parámetros
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
@@ -161,6 +165,7 @@ def optimize():
         if not solution:
             return jsonify(error="No se pudo encontrar solución."), 400
 
+        # Extraer rutas
         assignments = []
         total_distance = 0
         total_fuel_liters = 0.0
@@ -169,9 +174,9 @@ def optimize():
         for vehicle_id in range(num_vehicles):
             index = routing.Start(vehicle_id)
             if routing.IsEnd(index):
-                continue
+                continue  # este viaje ficticio no se usó
 
-            main_vehicle = vehicle_id // max_trips_per_vehicle
+            main_vehicle = vehicle_mapping[vehicle_id]
             route = []
             deliveries = []
             distance_vehicle = 0.0
@@ -187,27 +192,36 @@ def optimize():
                         "products": delivered
                     })
 
-                previous_index = index
+                prev_index = index
                 index = solution.Value(routing.NextVar(index))
-                dist = extended_distance_matrix[manager.IndexToNode(previous_index)][manager.IndexToNode(index)]
+                dist = extended_distance_matrix[manager.IndexToNode(prev_index)][manager.IndexToNode(index)]
                 distance_vehicle += dist
                 total_distance += dist
 
-            fuel_liters = distance_vehicle / vehicle_consume[main_vehicle]
+            fuel_liters = distance_vehicle / vehicle_consume[vehicle_id]
             total_fuel_liters += fuel_liters
 
             if time_dimension:
                 cumul = time_dimension.CumulVar(routing.End(vehicle_id))
                 route_time = solution.Value(cumul)
 
-            vehicle_trips[main_vehicle] = {
-                "vehicle": main_vehicle,
-                "route": [extended_locations[n].get("id") if n != 0 else 0 for n in route + [0]],
-                "deliveries": deliveries,
-                "total_time_minutes": route_time,
-                "total_distance": distance_vehicle,
-                "fuel_liters": fuel_liters
-            }
+            if main_vehicle not in vehicle_trips:
+                vehicle_trips[main_vehicle] = {
+                    "vehicle": main_vehicle,
+                    "route": [],
+                    "deliveries": [],
+                    "total_time_minutes": 0,
+                    "total_distance": 0.0,
+                    "fuel_liters": 0.0
+                }
+
+            vehicle_trips[main_vehicle]["route"].extend(
+                [extended_locations[n].get("id") if n != 0 else 0 for n in route + [0]]
+            )
+            vehicle_trips[main_vehicle]["deliveries"].extend(deliveries)
+            vehicle_trips[main_vehicle]["total_time_minutes"] += route_time
+            vehicle_trips[main_vehicle]["total_distance"] += distance_vehicle
+            vehicle_trips[main_vehicle]["fuel_liters"] += fuel_liters
 
         return jsonify({
             "status": "success",

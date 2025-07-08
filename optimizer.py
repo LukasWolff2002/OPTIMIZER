@@ -188,9 +188,11 @@ def optimize():
                 if node != depot:
                     delivered = extended_locations[node].get("demanda", {})
                     deliveries.append({
-                        "location_id": extended_locations[node].get("id"),
-                        "products": delivered
-                    })
+    "location_id": extended_locations[node].get("id"),
+    "node_index": node,   # importante!
+    "products": delivered
+})
+
 
                 prev_index = index
                 index = solution.Value(routing.NextVar(index))

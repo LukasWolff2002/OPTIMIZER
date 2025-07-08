@@ -4,7 +4,7 @@ curl -X POST http://localhost:3000/optimize \
     {
       "locations": [
         {"id": 1, "lat": 0, "lng": 0, "demanda": {}},
-        {"id": 2, "lat": 0, "lng": 1, "demanda": {"A": "125"}}
+        {"id": 2, "lat": 0, "lng": 1, "demanda": {"A": "300"}}
       ],
       "distance_matrix": [
         [0, 1],
@@ -14,9 +14,9 @@ curl -X POST http://localhost:3000/optimize \
         [0, 8.6],
         [8.5, 0]
       ],
-      "max_vehicles": 1,
-      "vehicle_capacities": [100],
-      "vehicle_consume": [10.0]
+      "max_vehicles": 2,
+      "vehicle_capacities": [100, 100],
+      "vehicle_consume": [10.0, 10.0]
     },
     [1],
     1

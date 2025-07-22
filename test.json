@@ -2,22 +2,62 @@ curl -X POST http://localhost:3000/optimize \
   -H "Content-Type: application/json" \
   -d '[
     {
-      "locations": [
-        {"id": 1, "lat": 0, "lng": 0, "demanda": {}},
-        {"id": 2, "lat": 0, "lng": 1, "demanda": {"A": "300"}}
+    "locations": [
+      {
+        "id": 1,
+        "lat": -32.7986876,
+        "lng": -71.14631170000001,
+        "demanda": {
+        },
+        "identificador": "WALMART CD"
+      },
+      {
+        "id": 4,
+        "lat": -32.880417,
+        "lng": -71.24946299999999,
+        "demanda": {
+          "Caja 1": "10"
+        },
+        "identificador": "CENCOSUD CD"
+      }
+    ],
+    "distance_matrix": [
+      [
+        0,
+        18
       ],
-      "distance_matrix": [
-        [0, 1],
-        [1, 0]
+      [
+        18,
+        0
+      ]
+    ],
+    "time_matrix": [
+      [
+        0,
+        25.56
       ],
-      "time_matrix": [
-        [0, 8.6],
-        [8.5, 0]
-      ],
-      "max_vehicles": 2,
-      "vehicle_capacities": [100, 100],
-      "vehicle_consume": [10.0, 10.0]
-    },
-    [1],
-    1
-  ]'
+      [
+        25.84,
+        0
+      ]
+    ],
+    "max_vehicles": 2,
+    "vehicle_capacities": [
+      100,
+      100
+    ],
+    "vehicle_consume": [
+      5.0,
+      5.0
+    ],
+    "vehicle_free": [
+      1,
+      0
+    ]
+  },
+  [
+    1,
+    2
+  ],
+  21
+]'

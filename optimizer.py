@@ -6,6 +6,20 @@ app = Flask(__name__)
 
 @app.route("/optimize", methods=["POST"])
 def optimize():
+
+    ubicaciones_refrigeradas = [
+        "WALMART CD",
+"CENCOSUD CD",
+"SANTA ISABEL LOCAL",
+"JUMBO LOCAL",
+"TOTTUS CD",
+"TOTTUS LOCAL",
+"UNIMARC CD",
+"UNIMARC LOCAL",
+"ARAMARK",
+"SODEXO"
+    ]
+
     raw_data = request.get_json()
     if raw_data is None:
         return jsonify(error="No se recibió JSON válido"), 400
@@ -35,16 +49,23 @@ def optimize():
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
         if len(vehicle_consume_base) != base_num_vehicles:
             return jsonify(error="La cantidad de consumos no coincide con max_vehicles"), 400
+        
+        vehicle_free_base = data.get("vehicle_free", [0]*base_num_vehicles)
+
+        if len(vehicle_free_base) != base_num_vehicles:
+            return jsonify(error="La cantidad de valores en vehicle_free no coincide con max_vehicles"), 400
 
         # ✅ Duplicar vehículos ficticios por viaje
         vehicle_capacities = []
         vehicle_consume = []
+        vehicle_free = []
         vehicle_mapping = {}
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
                 vehicle_capacities.append(vehicle_capacities_base[idx])
                 vehicle_consume.append(vehicle_consume_base[idx])
+                vehicle_free.append(vehicle_free_base[idx])
                 vehicle_mapping[len(vehicle_capacities)-1] = idx
 
         num_vehicles = len(vehicle_capacities)
@@ -62,14 +83,21 @@ def optimize():
         extended_demands = [0]
         split_mapping = {}
 
+        extended_requires_refrigeration = [False]  # el depósito no requiere refrigeración
+
         for idx, loc in enumerate(locations[1:], start=1):
             prod_quantities = {p: int(float(loc.get("demanda", {}).get(p, 0))) for p in all_products}
             total_demand = sum(prod_quantities.values())
+
+            identificador = loc.get("identificador", "").upper()
+            requires_refrigeration = any(nombre.upper() in identificador for nombre in ubicaciones_refrigeradas)
 
             if total_demand <= max_vehicle_capacity:
                 extended_locations.append(loc)
                 extended_demands.append(int(total_demand))
                 split_mapping[len(extended_locations)-1] = idx
+                extended_requires_refrigeration.append(requires_refrigeration)
+
             else:
                 proportions = {p: (q / total_demand) for p, q in prod_quantities.items()}
                 remaining = total_demand
@@ -78,6 +106,8 @@ def optimize():
                     amount = min(remaining, max_vehicle_capacity)
                     split_loc = copy.deepcopy(loc)
                     split_demand = {}
+                    extended_requires_refrigeration.append(requires_refrigeration)
+
 
                     if remaining - amount > 0:
                         for p in all_products:
@@ -109,6 +139,13 @@ def optimize():
 
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
+
+        for node_index in range(1, num_nodes):  # Omitir depósito
+            if extended_requires_refrigeration[node_index]:
+                for vehicle_id in range(num_vehicles):
+                    if not vehicle_free[vehicle_id]:  # No refrigerado
+                        routing.VehicleVar(manager.NodeToIndex(node_index)).RemoveValue(vehicle_id)
+
 
         # Callback de coste
         for v in range(num_vehicles):

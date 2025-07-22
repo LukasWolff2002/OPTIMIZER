@@ -41,6 +41,7 @@ def optimize():
         base_num_vehicles = data["max_vehicles"]
         vehicle_capacities_base = data["vehicle_capacities"]
         vehicle_consume_base = data.get("vehicle_consume", [1]*base_num_vehicles)
+        tiempo_calculo = data.get("tiempo_calculo")*60  # segundos
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
         max_trips_per_vehicle = 2  # ✅ Permitir múltiples viajes
@@ -152,7 +153,7 @@ def optimize():
             def make_vehicle_callback(v_idx):
                 return lambda from_index, to_index: int(
                     extended_distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-                    / vehicle_consume[v_idx] * 1000
+                    * vehicle_consume[v_idx] * 1000
                 )
             callback_idx = routing.RegisterTransitCallback(make_vehicle_callback(v))
             routing.SetArcCostEvaluatorOfVehicle(callback_idx, v)
@@ -195,7 +196,7 @@ def optimize():
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        search_parameters.time_limit.seconds = 30
+        search_parameters.time_limit.seconds = tiempo_calculo
 
         solution = routing.SolveWithParameters(search_parameters)
 
@@ -237,7 +238,7 @@ def optimize():
                 distance_vehicle += dist
                 total_distance += dist
 
-            fuel_liters = distance_vehicle / vehicle_consume[vehicle_id]
+            fuel_liters = distance_vehicle * vehicle_consume[vehicle_id]
             total_fuel_liters += fuel_liters
 
             if time_dimension:

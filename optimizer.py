@@ -153,7 +153,7 @@ def optimize():
             def make_vehicle_callback(v_idx):
                 return lambda from_index, to_index: int(
                     extended_distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-                    * vehicle_consume[v_idx] * 1000
+                    / vehicle_consume[v_idx] * 1000
                 )
             callback_idx = routing.RegisterTransitCallback(make_vehicle_callback(v))
             routing.SetArcCostEvaluatorOfVehicle(callback_idx, v)
@@ -238,7 +238,7 @@ def optimize():
                 distance_vehicle += dist
                 total_distance += dist
 
-            fuel_liters = distance_vehicle * vehicle_consume[vehicle_id]
+            fuel_liters = distance_vehicle / vehicle_consume[vehicle_id]
             total_fuel_liters += fuel_liters
 
             if time_dimension:

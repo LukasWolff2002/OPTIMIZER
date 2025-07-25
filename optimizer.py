@@ -141,6 +141,32 @@ def optimize():
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
 
+        # --------------------------
+        # 🚫 RESTRICCIÓN EXCLUSIVA PARA CD
+        # --------------------------
+
+        cd_identificadores = ["WALMART CD", "CENCOSUD CD"]
+        cd_nodes_by_identificador = {cd: [] for cd in cd_identificadores}
+
+        # Paso 1: Agrupar nodos por identificador exacto
+        for node_index in range(1, num_nodes):  # omitir depósito
+            identificador = extended_locations[node_index].get("identificador", "").upper()
+            if identificador in cd_identificadores:
+                cd_nodes_by_identificador[identificador].append(node_index)
+
+        # Paso 2: Para cada tipo de CD, restringir a que el camión solo vaya a ese tipo
+        for cd_identificador, nodes_in_group in cd_nodes_by_identificador.items():
+            for cd_node in nodes_in_group:
+                for vehicle_id in range(num_vehicles):
+                    # Si el vehículo va a un nodo de este tipo, no puede ir a nodos de otro tipo
+                    for other_node in range(1, num_nodes):
+                        other_identificador = extended_locations[other_node].get("identificador", "").upper()
+                        if other_node == cd_node:
+                            continue
+                        if other_identificador != cd_identificador:
+                            routing.VehicleVar(manager.NodeToIndex(other_node)).RemoveValue(vehicle_id)
+
+
         for node_index in range(1, num_nodes):  # Omitir depósito
             if extended_requires_refrigeration[node_index]:
                 for vehicle_id in range(num_vehicles):

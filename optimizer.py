@@ -126,6 +126,20 @@ def optimize():
 
         num_nodes = len(extended_locations)
 
+        # ------------------------------------------------------------
+        #  🆕  Clasificación de nodos por grupo (WALMART / CENCOSUD / OTHER)
+        # ------------------------------------------------------------
+        def _group(identificador: str) -> str:
+            ident = (identificador or "").upper()
+            if "WALMART CD" in ident:
+                return "WALMART"
+            if "CENCOSUD CD" in ident:
+                return "CENCOSUD"
+            return "OTHER"
+
+        node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
+        HIGH_PENALTY = 10_000_000  # coste prohibitivo para mezclar grupos
+
         def extend_matrix(base_matrix):
             new_matrix = [[0]*num_nodes for _ in range(num_nodes)]
             for i in range(num_nodes):
@@ -141,32 +155,6 @@ def optimize():
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
 
-        # --------------------------
-        # 🚫 RESTRICCIÓN EXCLUSIVA PARA CD
-        # --------------------------
-
-        cd_identificadores = ["WALMART CD", "CENCOSUD CD"]
-        cd_nodes_by_identificador = {cd: [] for cd in cd_identificadores}
-
-        # Paso 1: Agrupar nodos por identificador exacto
-        for node_index in range(1, num_nodes):  # omitir depósito
-            identificador = extended_locations[node_index].get("identificador", "").upper()
-            if identificador in cd_identificadores:
-                cd_nodes_by_identificador[identificador].append(node_index)
-
-        # Paso 2: Para cada tipo de CD, restringir a que el camión solo vaya a ese tipo
-        for cd_identificador, nodes_in_group in cd_nodes_by_identificador.items():
-            for cd_node in nodes_in_group:
-                for vehicle_id in range(num_vehicles):
-                    # Si el vehículo va a un nodo de este tipo, no puede ir a nodos de otro tipo
-                    for other_node in range(1, num_nodes):
-                        other_identificador = extended_locations[other_node].get("identificador", "").upper()
-                        if other_node == cd_node:
-                            continue
-                        if other_identificador != cd_identificador:
-                            routing.VehicleVar(manager.NodeToIndex(other_node)).RemoveValue(vehicle_id)
-
-
         for node_index in range(1, num_nodes):  # Omitir depósito
             if extended_requires_refrigeration[node_index]:
                 for vehicle_id in range(num_vehicles):
@@ -175,14 +163,32 @@ def optimize():
 
 
         # Callback de coste
+        # ------------------------------------------------------------------
+        #  🆕  Callback de coste con penalización por mezclar grupos
+        # ------------------------------------------------------------------
         for v in range(num_vehicles):
             def make_vehicle_callback(v_idx):
-                return lambda from_index, to_index: int(
-                    extended_distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-                    / vehicle_consume[v_idx] * 1000
-                )
+                def distance(from_index, to_index, rate=vehicle_consume[v_idx]):
+                    from_node = manager.IndexToNode(from_index)
+                    to_node   = manager.IndexToNode(to_index)
+
+                    base = int(extended_distance_matrix[from_node][to_node] / rate * 1000)
+
+                    # Penalización si se mezclan grupos "WALMART" o "CENCOSUD" con otro distinto
+                    if from_node != depot and to_node != depot:
+                        g_from, g_to = node_group[from_node], node_group[to_node]
+                        if g_from != g_to and (
+                            "WALMART" in (g_from, g_to) or
+                            "CENCOSUD" in (g_from, g_to)
+                        ):
+                            return base + HIGH_PENALTY
+                    return base
+                return distance
+
             callback_idx = routing.RegisterTransitCallback(make_vehicle_callback(v))
             routing.SetArcCostEvaluatorOfVehicle(callback_idx, v)
+        # ------------------------------------------------------------------
+
 
         # Callback de demanda
         def demand_callback(from_index):
@@ -252,10 +258,10 @@ def optimize():
                 if node != depot:
                     delivered = extended_locations[node].get("demanda", {})
                     deliveries.append({
-    "location_id": extended_locations[node].get("id"),
-    "node_index": node,   # importante!
-    "products": delivered
-})
+                        "location_id": extended_locations[node].get("id"),
+                        "node_index": node,   # importante!
+                        "products": delivered
+                    })
 
 
                 prev_index = index

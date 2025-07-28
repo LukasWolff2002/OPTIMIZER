@@ -5,149 +5,57 @@ curl -X POST http://localhost:3000/optimize \
     "locations": [
       {
         "id": 1,
-        "lat": -32.8729346,
-        "lng": -71.21502410000001,
+        "lat": -32.880417,
+        "lng": -71.24946299999999,
         "demanda": {
         },
         "identificador": "PACKING"
       },
       {
-        "id": 4,
-        "lat": -33.4000795,
-        "lng": -70.5921517,
+        "id": 2,
+        "lat": -32.9394663,
+        "lng": -71.5463031,
         "demanda": {
           "Caja Jumbo": "10"
         },
-        "identificador": "CENCOSUD CD"
-      },
-      {
-        "id": 5,
-        "lat": -33.3917225,
-        "lng": -70.545998,
-        "demanda": {
-          "Caja Jumbo": "10"
-        },
-        "identificador": "CENCOSUD CD"
-      },
-      {
-        "id": 6,
-        "lat": -33.4245602,
-        "lng": -70.55370719999999,
-        "demanda": {
-          "Caja Wallmart": "10"
-        },
-        "identificador": "WALMART CD"
-      },
-      {
-        "id": 8,
-        "lat": -33.4488897,
-        "lng": -70.6692655,
-        "demanda": {
-          "Caja Jumbo Jumbo": "10"
-        },
-        "identificador": "PUNTO AZUL"
+        "identificador": "JUMBO LOCAL"
       }
     ],
     "distance_matrix": [
       [
         0,
-        127,
-        132,
-        132,
-        125
+        33
       ],
       [
-        127,
-        0,
-        5,
-        5,
-        12
-      ],
-      [
-        132,
-        5,
-        0,
-        4,
-        16
-      ],
-      [
-        133,
-        6,
-        3,
-        0,
-        16
-      ],
-      [
-        127,
-        13,
-        16,
-        15,
+        33,
         0
       ]
     ],
     "time_matrix": [
       [
         0,
-        105.02,
-        108.94,
-        113.92,
-        105.5
+        54.6
       ],
       [
-        106.38000000000001,
-        0,
-        11.959999999999999,
-        13.059999999999999,
-        22.12
-      ],
-      [
-        111.84,
-        12.14,
-        0,
-        12.620000000000001,
-        26.38
-      ],
-      [
-        115.82,
-        16.279999999999998,
-        11.299999999999999,
-        0,
-        32.14
-      ],
-      [
-        107.82,
-        25.5,
-        26.82,
-        32.059999999999995,
+        54.35999999999999,
         0
       ]
     ],
-    "max_vehicles": 4,
+    "max_vehicles": 1,
     "vehicle_capacities": [
-      100,
-      100,
-      100,
       100
     ],
     "vehicle_consume": [
-      5.0,
-      5.0,
-      5.0,
       5.0
     ],
     "vehicle_free": [
-      1,
-      1,
-      1,
       1
     ],
-    "tiempo_calculo": 0.5
+    "tiempo_calculo": 1
   },
   [
-    1,
-    2,
-    3,
-    4
+    1
   ],
   1
-]'
+]
+'

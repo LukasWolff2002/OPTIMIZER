@@ -45,6 +45,8 @@ def optimize():
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
         max_trips_per_vehicle = 2  # ✅ Permitir múltiples viajes
+        costo_varias_rutas = True
+        costo_reingreso_valor = 10_000  # puedes ajustar este valor
 
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
@@ -182,6 +184,10 @@ def optimize():
                             "CENCOSUD" in (g_from, g_to)
                         ):
                             return base + HIGH_PENALTY
+                        
+                     # 🆕 Penalización por volver a salir del depósito
+                    if from_node == depot and to_node != depot and costo_varias_rutas:
+                        base += costo_reingreso_valor
                     return base
                 return distance
 

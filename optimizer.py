@@ -46,7 +46,7 @@ def optimize():
         time_matrix = data.get("time_matrix")
         max_trips_per_vehicle = 2  # ✅ Permitir múltiples viajes
         costo_varias_rutas = True
-        costo_reingreso_valor = 10_000  # puedes ajustar este valor
+        costo_reingreso_valor = 100_000  # puedes ajustar este valor
 
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="La cantidad de capacidades no coincide con max_vehicles"), 400
@@ -140,7 +140,7 @@ def optimize():
             return "OTHER"
 
         node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
-        HIGH_PENALTY = 10_000_000  # coste prohibitivo para mezclar grupos
+        HIGH_PENALTY = 100_000  # coste prohibitivo para mezclar grupos
 
         def extend_matrix(base_matrix):
             new_matrix = [[0]*num_nodes for _ in range(num_nodes)]
@@ -156,6 +156,7 @@ def optimize():
 
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
+       
 
         for node_index in range(1, num_nodes):  # Omitir depósito
             if extended_requires_refrigeration[node_index]:
@@ -183,11 +184,8 @@ def optimize():
                             "WALMART" in (g_from, g_to) or
                             "CENCOSUD" in (g_from, g_to)
                         ):
-                            return base + HIGH_PENALTY
+                            base += HIGH_PENALTY
                         
-                     # 🆕 Penalización por volver a salir del depósito
-                    if from_node == depot and to_node != depot and costo_varias_rutas:
-                        base += costo_reingreso_valor
                     return base
                 return distance
 
@@ -221,12 +219,18 @@ def optimize():
             time_callback_index = routing.RegisterTransitCallback(time_callback)
             routing.AddDimension(
                 time_callback_index,
-                0,
-                480,
+                0,  # slack
+                480,  # un valor suficientemente alto para no restringir aquí
                 True,
                 "Time"
             )
             time_dimension = routing.GetDimensionOrDie("Time")
+            time_dimension.SetGlobalSpanCostCoefficient(100)
+
+            # Establecer límite por vehículo al final de la ruta
+            for v in range(num_vehicles):
+                time_dimension.CumulVar(routing.End(v)).SetMax(480)
+
         else:
             time_dimension = None
 
@@ -234,7 +238,7 @@ def optimize():
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        search_parameters.time_limit.seconds = tiempo_calculo
+        search_parameters.time_limit.seconds = 10#tiempo_calculo
 
         solution = routing.SolveWithParameters(search_parameters)
 

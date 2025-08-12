@@ -1,7 +1,4 @@
-curl -X POST http://localhost:3000/optimize \
-  -H "Content-Type: application/json" \
-  -d '[
-  {
+{
   "locations": [
     {
       "id": 1,
@@ -340,7 +337,7 @@ curl -X POST http://localhost:3000/optimize \
     1,
     1
   ],
-  "tiempo_calculo": 1
+  "tiempo_calculo": 60
 },
 [
   1,
@@ -350,4 +347,4 @@ curl -X POST http://localhost:3000/optimize \
   6,
   7
 ],
-37]'
+37]

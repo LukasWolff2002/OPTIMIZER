@@ -330,6 +330,6 @@ def optimize():
         import traceback
         return jsonify(error=f"Error interno: {str(e)}", traceback=traceback.format_exc()), 500
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=3000, debug=False)
+#if __name__ == "__main__":
+#    app.run(host="0.0.0.0", port=3000, debug=False)
 

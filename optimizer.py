@@ -393,6 +393,7 @@ def optimize():
             # Totales globales
             total_revenue += trip_revenue
             total_kg += trip_kg
+            #Hi
             total_units += trip_units
 
 

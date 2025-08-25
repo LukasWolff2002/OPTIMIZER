@@ -261,7 +261,7 @@ def optimize():
         # ...
         vehicle_trips = {}
         total_distance, total_fuel_liters = 0.0, 0.0
-        total_revenue, total_kg, total_units = 0.0, 0.0, 0.0  # 👈 NEW totales globales
+        total_kg, total_units = 0.0, 0.0  # 👈 NEW totales globales
 
         for v in range(num_vehicles):
             index = routing.Start(v)
@@ -286,7 +286,6 @@ def optimize():
                     products_detail = []
                     stop_kg = 0.0
                     stop_units = 0.0
-                    stop_revenue = 0.0
 
                     # demanda viene como dict {product_id(str|int) -> kg(str|float|int)}
                     for pid_key, kg_val in demanda.items():
@@ -305,7 +304,6 @@ def optimize():
                         subtotal = kg * price
 
                         stop_kg += kg
-                        stop_revenue += subtotal
                         if units is not None:
                             stop_units += units
 
@@ -328,8 +326,7 @@ def optimize():
                         "products_detail": products_detail,    # lista de ítems con precio/peso/unidades
                         "totals": {                            # agregados por parada
                             "kg": round(stop_kg, 2),
-                            "units": (round(stop_units, 2) if stop_units > 0 else None),
-                            "revenue": round(stop_revenue, 2)
+                            "units": (round(stop_units, 2) if stop_units > 0 else None)
                         }
                     })
 
@@ -352,7 +349,7 @@ def optimize():
             trip_kg = sum((d["totals"]["kg"] for d in deliveries if d.get("totals")), 0.0)
             trip_units_vals = [d["totals"].get("units") for d in deliveries if d.get("totals")]
             trip_units = sum((u for u in trip_units_vals if u is not None), 0.0)
-            trip_revenue = sum((d["totals"]["revenue"] for d in deliveries if d.get("totals")), 0.0)
+            
 
             # Construir ruta con IDs (0 ... 0)
             raw_route = [0] + [extended_locations[n].get("id") if n else 0 for n in route_nodes] + [0]
@@ -367,7 +364,6 @@ def optimize():
                 "trips": [],
                 "total_distance": 0.0,
                 "total_fuel_liters": 0.0,
-                "total_revenue": 0.0,  # 👈 NEW
                 "total_kg": 0.0,       # 👈 NEW
                 "total_units": 0.0     # 👈 NEW
             })
@@ -380,18 +376,15 @@ def optimize():
                 "fuel_liters": fuel,
                 # 👇 agregados por viaje
                 "total_kg": round(trip_kg, 2),
-                "total_units": (round(trip_units, 2) if trip_units > 0 else None),
-                "revenue": round(trip_revenue, 2)
+                "total_units": (round(trip_units, 2) if trip_units > 0 else None)
             })
 
             agg["total_distance"] += dist_v
             agg["total_fuel_liters"] += fuel
-            agg["total_revenue"] += trip_revenue
             agg["total_kg"] += trip_kg
             agg["total_units"] += trip_units
 
             # Totales globales
-            total_revenue += trip_revenue
             total_kg += trip_kg
             #Hi
             total_units += trip_units

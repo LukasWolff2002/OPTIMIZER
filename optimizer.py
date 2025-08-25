@@ -258,8 +258,10 @@ def optimize():
             return jsonify(error="No se pudo encontrar solución."), 400
 
         # Extraer resultados (consolidando por camión real, PERO guardando viajes separados)
+        # ...
         vehicle_trips = {}
         total_distance, total_fuel_liters = 0.0, 0.0
+        total_revenue, total_kg, total_units = 0.0, 0.0, 0.0  # 👈 NEW totales globales
 
         for v in range(num_vehicles):
             index = routing.Start(v)
@@ -272,12 +274,65 @@ def optimize():
             while not routing.IsEnd(index):
                 node = manager.IndexToNode(index)
                 route_nodes.append(node)
+
                 if node != depot:
+                    ext = extended_locations[node]
+                    loc_id   = ext.get("id")
+                    demanda  = ext.get("demanda", {}) or {}
+                    precios  = ext.get("precios", {}) or {}
+                    pesos    = ext.get("pesos", {}) or {}
+                    packs    = ext.get("unidades", {}) or {}
+
+                    products_detail = []
+                    stop_kg = 0.0
+                    stop_units = 0.0
+                    stop_revenue = 0.0
+
+                    # demanda viene como dict {product_id(str|int) -> kg(str|float|int)}
+                    for pid_key, kg_val in demanda.items():
+                        pid_str = str(pid_key)
+                        # robustez al castear kg
+                        try:
+                            kg = float(kg_val)
+                        except Exception:
+                            kg = float(str(kg_val).replace(",", ".")) if kg_val is not None else 0.0
+
+                        price = float(precios.get(pid_str, 0) or 0)
+                        unit_weight = float(pesos.get(pid_str, 0) or 0)   # kg por unidad
+                        pack_units  = int(packs.get(pid_str, 0) or 0)
+
+                        units = (kg / unit_weight) if unit_weight > 0 else None
+                        subtotal = kg * price
+
+                        stop_kg += kg
+                        stop_revenue += subtotal
+                        if units is not None:
+                            stop_units += units
+
+                        products_detail.append({
+                            "product_id": int(pid_str) if pid_str.isdigit() else pid_str,
+                            "kg": round(kg, 2),
+                            "price_unit": price,
+                            "unit_weight_kg": (unit_weight if unit_weight > 0 else None),
+                            "units": (round(units, 2) if units is not None else None),
+                            "pack_units": (pack_units if pack_units > 0 else None),
+                            "subtotal": round(subtotal, 2)
+                        })
+
                     deliveries.append({
-                        "location_id": extended_locations[node].get("id"),
+                        "location_id": loc_id,
                         "node_index": node,
-                        "products": extended_locations[node].get("demanda", {})
+                        # compatibilidad hacia atrás:
+                        "products": demanda,                   # dict product_id -> kg
+                        # detalle enriquecido:
+                        "products_detail": products_detail,    # lista de ítems con precio/peso/unidades
+                        "totals": {                            # agregados por parada
+                            "kg": round(stop_kg, 2),
+                            "units": (round(stop_units, 2) if stop_units > 0 else None),
+                            "revenue": round(stop_revenue, 2)
+                        }
                     })
+
                 prev = index
                 index = solution.Value(routing.NextVar(index))
                 d = extended_distance_matrix[manager.IndexToNode(prev)][manager.IndexToNode(index)]
@@ -293,30 +348,54 @@ def optimize():
             if not deliveries:
                 continue
 
-            # Construir ruta con IDs (0 al inicio y fin)
+            # Totales por viaje (sumando paradas)
+            trip_kg = sum((d["totals"]["kg"] for d in deliveries if d.get("totals")), 0.0)
+            trip_units_vals = [d["totals"].get("units") for d in deliveries if d.get("totals")]
+            trip_units = sum((u for u in trip_units_vals if u is not None), 0.0)
+            trip_revenue = sum((d["totals"]["revenue"] for d in deliveries if d.get("totals")), 0.0)
+
+            # Construir ruta con IDs (0 ... 0)
             raw_route = [0] + [extended_locations[n].get("id") if n else 0 for n in route_nodes] + [0]
-            # Limpiar dobles ceros
             cleaned = [raw_route[0]]
             for n in raw_route[1:]:
                 if not (n == 0 and cleaned[-1] == 0):
                     cleaned.append(n)
 
-            # Registrar viaje (no sumamos tiempos entre viajes para no “romper” el límite)
+            # Registrar viaje
             agg = vehicle_trips.setdefault(main_vehicle, {
                 "vehicle": main_vehicle,
-                "trips": [],                 # lista de viajes
+                "trips": [],
                 "total_distance": 0.0,
-                "total_fuel_liters": 0.0
+                "total_fuel_liters": 0.0,
+                "total_revenue": 0.0,  # 👈 NEW
+                "total_kg": 0.0,       # 👈 NEW
+                "total_units": 0.0     # 👈 NEW
             })
+
             agg["trips"].append({
-                "route": cleaned,                   # 0 ... 0 (un viaje)
+                "route": cleaned,
                 "deliveries": deliveries,
-                "time_minutes": time_v,             # <= HORIZON garantizado
+                "time_minutes": time_v,
                 "distance": dist_v,
-                "fuel_liters": fuel
+                "fuel_liters": fuel,
+                # 👇 agregados por viaje
+                "total_kg": round(trip_kg, 2),
+                "total_units": (round(trip_units, 2) if trip_units > 0 else None),
+                "revenue": round(trip_revenue, 2)
             })
+
             agg["total_distance"] += dist_v
             agg["total_fuel_liters"] += fuel
+            agg["total_revenue"] += trip_revenue
+            agg["total_kg"] += trip_kg
+            agg["total_units"] += trip_units
+
+            # Totales globales
+            total_revenue += trip_revenue
+            total_kg += trip_kg
+            total_units += trip_units
+
+
 
         return jsonify({
             "status": "success",

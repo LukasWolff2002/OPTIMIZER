@@ -154,46 +154,48 @@ def optimize():
         node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
         HIGH_PENALTY = 100_000  # sigue ahí; modos ya hacen la exclusividad dura
 
-        # Prioridad escalonada: PUNTO AZUL > LA VEGA > TOTTUS CD > otros (solo en OTHER)
+        # Prioridad escalonada: PA > LV > (TOTTUS CD | UNIMARC CD) > otros (solo en OTHER)
         prioridad_pa_tag = "PUNTO AZUL"
         prioridad_lv_tag = "LA VEGA"
         prioridad_tottus_tag = "TOTTUS CD"
+        prioridad_unimarc_tag = "UNIMARC CD"
 
-        is_priority_node = []  # PA o LV o TOTTUS
-        is_pa_node = []
-        is_lv_node = []
-        is_tottus_node = []
+        is_pa_node, is_lv_node, is_tottus_node, is_unimarc_node, is_priority_node = [], [], [], [], []
         for loc in extended_locations:
             ident = (loc.get("identificador", "") or "").upper()
             is_pa = prioridad_pa_tag in ident
             is_lv = prioridad_lv_tag in ident
             is_tot = prioridad_tottus_tag in ident
+            is_uni = prioridad_unimarc_tag in ident
             is_pa_node.append(is_pa)
             is_lv_node.append(is_lv)
             is_tottus_node.append(is_tot)
-            is_priority_node.append(is_pa or is_lv or is_tot)
+            is_unimarc_node.append(is_uni)
+            is_priority_node.append(is_pa or is_lv or is_tot or is_uni)
 
         any_pa_exists = any(is_pa_node[1:])
         any_lv_exists = any(is_lv_node[1:])
-        any_tottus_exists = any(is_tottus_node[1:])
+        any_tier3_exists = any((is_tottus_node[i] or is_unimarc_node[i]) for i in range(1, len(is_tottus_node)))
 
-        # Pesos de penalización (ajústalos según tus magnitudes)
+        def is_tier3(i):
+            return is_tottus_node[i] or is_unimarc_node[i]
+
+        # Pesos de penalización
         START_PENALTY_OTHER_WITH_PA = 90_000   # con PA presente, empezar en 'otros'
-        START_PENALTY_TOT_WITH_PA   = 60_000   # con PA presente, empezar en TOTTUS
+        START_PENALTY_TIER3_WITH_PA = 60_000   # con PA presente, empezar en TIER3 (TOTTUS/UNIMARC)
         START_PENALTY_LV_WITH_PA    = 35_000   # con PA presente, empezar en LA VEGA
 
         START_PENALTY_OTHER_WITH_LV = 60_000   # sin PA pero con LV, empezar en 'otros'
-        START_PENALTY_TOT_WITH_LV   = 25_000   # sin PA pero con LV, empezar en TOTTUS
+        START_PENALTY_TIER3_WITH_LV = 25_000   # sin PA pero con LV, empezar en TIER3
 
-        START_PENALTY_OTHER_WITH_TOT = 45_000  # sin PA ni LV, con TOTTUS, empezar en 'otros'
+        START_PENALTY_OTHER_WITH_TIER3 = 45_000  # solo TIER3 presente, empezar en 'otros'
 
         PA_LATE_ENTRY_PENALTY       = 100_000  # entrar a PA después de algo que no es PA
-        LV_LATE_ENTRY_PENALTY       = 70_000   # entrar a LV después de un no-prioritario (ni PA ni LV ni TOTTUS)
-        TOT_LATE_ENTRY_PENALTY      = 45_000   # entrar a TOTTUS después de un nodo 'otros' (ni PA ni LV ni TOTTUS)
+        LV_LATE_ENTRY_PENALTY       = 70_000   # entrar a LV después de un no-prioritario (ni PA/LV/TIER3)
+        TIER3_LATE_ENTRY_PENALTY    = 45_000   # entrar a TIER3 después de 'otros'
 
-        PA_AFTER_LV_EXTRA_PENALTY   = 80_000   # evitar LV -> PA
-        PA_AFTER_TOT_EXTRA_PENALTY  = 70_000   # evitar TOTTUS -> PA
-        LV_AFTER_TOT_EXTRA_PENALTY  = 40_000   # evitar TOTTUS -> LV
+        PA_AFTER_TIER3_EXTRA_PENALTY = 70_000  # evitar TIER3 -> PA
+        LV_AFTER_TIER3_EXTRA_PENALTY = 40_000  # evitar TIER3 -> LV
 
         # Extensión de matrices
         def extend_matrix(base_matrix):
@@ -251,55 +253,49 @@ def optimize():
 
                     # Prioridades SOLO aplican a clientes OTHER
                     if node_group[to_node] == "OTHER":
-                        # Prioridad escalonada al salir del depósito
+                        # Al salir del depósito
                         if to_node != depot and from_node == depot:
                             if any_pa_exists:
-                                # Con PA presente: PA (0), luego LV, luego TOTTUS, luego otros
+                                # Preferimos PA > LV > TIER3 > otros
                                 if is_pa_node[to_node]:
                                     pass
                                 elif is_lv_node[to_node]:
                                     base += START_PENALTY_LV_WITH_PA
-                                elif is_tottus_node[to_node]:
-                                    base += START_PENALTY_TOT_WITH_PA
+                                elif is_tier3(to_node):
+                                    base += START_PENALTY_TIER3_WITH_PA
                                 else:
                                     base += START_PENALTY_OTHER_WITH_PA
                             elif any_lv_exists:
-                                # Sin PA pero con LV: LV (0), luego TOTTUS, luego otros
+                                # Sin PA pero con LV: LV > TIER3 > otros
                                 if is_lv_node[to_node]:
                                     pass
-                                elif is_tottus_node[to_node]:
-                                    base += START_PENALTY_TOT_WITH_LV
+                                elif is_tier3(to_node):
+                                    base += START_PENALTY_TIER3_WITH_LV
                                 else:
                                     base += START_PENALTY_OTHER_WITH_LV
-                            elif any_tottus_exists:
-                                # Solo TOTTUS presente: TOTTUS (0), luego otros
-                                if not is_tottus_node[to_node]:
-                                    base += START_PENALTY_OTHER_WITH_TOT
+                            elif any_tier3_exists:
+                                # Solo TIER3: TIER3 > otros
+                                if not is_tier3(to_node):
+                                    base += START_PENALTY_OTHER_WITH_TIER3
                             # Si no hay ninguno, nada especial
 
-                        # Prioridad dentro de la ruta (entrada tardía)
+                        # Dentro de la ruta
                         if from_node != depot and to_node != depot:
-                            # Entrar a PA después de algo que no es PA (incluye LV/TOTTUS/otros)
+                            # Entrar a PA tardíamente
                             if is_pa_node[to_node] and not is_pa_node[from_node]:
                                 base += PA_LATE_ENTRY_PENALTY
-
-                            # Entrar a LV después de un no-prioritario (ni PA ni LV ni TOTTUS)
-                            if is_lv_node[to_node] and (not is_lv_node[from_node] and not is_pa_node[from_node] and not is_tottus_node[from_node]):
+                            # Entrar a LV desde no-prioritario (ni PA/LV/TIER3)
+                            if is_lv_node[to_node] and (not is_lv_node[from_node] and not is_pa_node[from_node] and not is_tier3(from_node)):
                                 base += LV_LATE_ENTRY_PENALTY
+                            # Entrar a TIER3 desde 'otros' (no PA/LV/TIER3)
+                            if is_tier3(to_node) and (not is_pa_node[from_node] and not is_lv_node[from_node] and not is_tier3(from_node)):
+                                base += TIER3_LATE_ENTRY_PENALTY
 
-                            # Entrar a TOTTUS después de 'otros' (no PA/LV/TOTTUS)
-                            if is_tottus_node[to_node] and (not is_pa_node[from_node] and not is_lv_node[from_node] and not is_tottus_node[from_node]):
-                                base += TOT_LATE_ENTRY_PENALTY
-
-                            # Evitar PA después de LV/TOTTUS (preferimos PA antes que ambos)
-                            if is_lv_node[from_node] and is_pa_node[to_node]:
-                                base += PA_AFTER_LV_EXTRA_PENALTY
-                            if is_tottus_node[from_node] and is_pa_node[to_node]:
-                                base += PA_AFTER_TOT_EXTRA_PENALTY
-
-                            # Evitar LV después de TOTTUS (preferimos LV antes que TOTTUS)
-                            if is_tottus_node[from_node] and is_lv_node[to_node]:
-                                base += LV_AFTER_TOT_EXTRA_PENALTY
+                            # Evitar TIER3 -> PA / TIER3 -> LV (preferimos PA y luego LV antes)
+                            if is_tier3(from_node) and is_pa_node[to_node]:
+                                base += PA_AFTER_TIER3_EXTRA_PENALTY
+                            if is_tier3(from_node) and is_lv_node[to_node]:
+                                base += LV_AFTER_TIER3_EXTRA_PENALTY
 
                     # Penalización mezcla entre grupos (redundante con modos, pero inocua)
                     if from_node != depot and to_node != depot:

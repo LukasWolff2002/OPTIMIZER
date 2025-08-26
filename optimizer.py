@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import copy
 import math
-import os  # <-- nuevo
 
 app = Flask(__name__)
 
@@ -373,23 +372,6 @@ def optimize():
         search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         search_parameters.time_limit.FromSeconds(tiempo_calculo)
-
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # MULTIHILO DEL SOLVER (usa 32 o CPU count por defecto; configurable)
-        req_workers = data.get("search_workers")
-        if req_workers is None:
-            req_workers = os.environ.get("ORTOOLS_WORKERS")  # opcional vía env
-        try:
-            req_workers = int(req_workers) if req_workers is not None else 0
-        except Exception:
-            req_workers = 0
-        if req_workers <= 0:
-            req_workers = min(32, os.cpu_count() or 1)
-        search_parameters.number_of_workers = req_workers
-
-        # Log de búsqueda opcional
-        search_parameters.log_search = bool(data.get("log_search", False))
-        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         solution = routing.SolveWithParameters(search_parameters)
         if not solution:

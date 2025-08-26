@@ -23,7 +23,7 @@ curl -X POST http://localhost:3000/optimize \
         "id": 2,
         "lat": -33.1081237,
         "lng": -70.78594199999999,
-        "identificador": "PUNTO AZUL",
+        "identificador": "LA VEGA",
         "demanda": {
           "200": 21.0
         },
@@ -59,7 +59,7 @@ curl -X POST http://localhost:3000/optimize \
         "id": 76,
         "lat": -33.3845341,
         "lng": -70.5547303,
-        "identificador": "LA VEGA",
+        "identificador": "PUNTO AZUL",
         "demanda": {
           "207": 142.0
         },
@@ -286,7 +286,7 @@ curl -X POST http://localhost:3000/optimize \
       1,
       1
     ],
-    "tiempo_calculo": 1
+    "tiempo_calculo": 0.1
   },
   [
     1,

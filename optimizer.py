@@ -154,30 +154,46 @@ def optimize():
         node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
         HIGH_PENALTY = 100_000  # sigue ahí; modos ya hacen la exclusividad dura
 
-        # Prioridad escalonada: PUNTO AZUL > LA VEGA > otros (solo en OTHER)
+        # Prioridad escalonada: PUNTO AZUL > LA VEGA > TOTTUS CD > otros (solo en OTHER)
         prioridad_pa_tag = "PUNTO AZUL"
         prioridad_lv_tag = "LA VEGA"
-        is_priority_node = []  # PA o LV
+        prioridad_tottus_tag = "TOTTUS CD"
+
+        is_priority_node = []  # PA o LV o TOTTUS
         is_pa_node = []
         is_lv_node = []
+        is_tottus_node = []
         for loc in extended_locations:
             ident = (loc.get("identificador", "") or "").upper()
             is_pa = prioridad_pa_tag in ident
             is_lv = prioridad_lv_tag in ident
+            is_tot = prioridad_tottus_tag in ident
             is_pa_node.append(is_pa)
             is_lv_node.append(is_lv)
-            is_priority_node.append(is_pa or is_lv)
+            is_tottus_node.append(is_tot)
+            is_priority_node.append(is_pa or is_lv or is_tot)
+
         any_pa_exists = any(is_pa_node[1:])
         any_lv_exists = any(is_lv_node[1:])
+        any_tottus_exists = any(is_tottus_node[1:])
 
         # Pesos de penalización (ajústalos según tus magnitudes)
-        START_PENALTY_OTHER_WITH_PA = 80_000   # si hay PA, empezar en un no-prioritario
-        START_PENALTY_LV_WITH_PA    = 30_000   # si hay PA, empezar en LA VEGA
-        START_PENALTY_OTHER_WITH_LV = 50_000   # si no hay PA pero sí LV, empezar en no-prioritario
+        START_PENALTY_OTHER_WITH_PA = 90_000   # con PA presente, empezar en 'otros'
+        START_PENALTY_TOT_WITH_PA   = 60_000   # con PA presente, empezar en TOTTUS
+        START_PENALTY_LV_WITH_PA    = 35_000   # con PA presente, empezar en LA VEGA
 
-        PA_LATE_ENTRY_PENALTY       = 90_000   # entrar a PA desde no-PA
-        LV_LATE_ENTRY_PENALTY       = 60_000   # entrar a LV desde no-prioritario
-        PA_AFTER_LV_EXTRA_PENALTY   = 70_000   # ir de LV -> PA (consecutivo): queremos PA antes que LV
+        START_PENALTY_OTHER_WITH_LV = 60_000   # sin PA pero con LV, empezar en 'otros'
+        START_PENALTY_TOT_WITH_LV   = 25_000   # sin PA pero con LV, empezar en TOTTUS
+
+        START_PENALTY_OTHER_WITH_TOT = 45_000  # sin PA ni LV, con TOTTUS, empezar en 'otros'
+
+        PA_LATE_ENTRY_PENALTY       = 100_000  # entrar a PA después de algo que no es PA
+        LV_LATE_ENTRY_PENALTY       = 70_000   # entrar a LV después de un no-prioritario (ni PA ni LV ni TOTTUS)
+        TOT_LATE_ENTRY_PENALTY      = 45_000   # entrar a TOTTUS después de un nodo 'otros' (ni PA ni LV ni TOTTUS)
+
+        PA_AFTER_LV_EXTRA_PENALTY   = 80_000   # evitar LV -> PA
+        PA_AFTER_TOT_EXTRA_PENALTY  = 70_000   # evitar TOTTUS -> PA
+        LV_AFTER_TOT_EXTRA_PENALTY  = 40_000   # evitar TOTTUS -> LV
 
         # Extensión de matrices
         def extend_matrix(base_matrix):
@@ -233,35 +249,60 @@ def optimize():
                     base_dist = extended_distance_matrix[from_node][to_node]
                     base = max(0, int(round((base_dist / max(rate, 1e-9)) * 1000)))
 
-                    # Prioridad escalonada al salir del depósito
-                    if to_node != depot and from_node == depot:
-                        if any_pa_exists:
-                            # Con PA presente: PA (mejor), luego LV, luego otros
-                            if is_pa_node[to_node]:
-                                pass
-                            elif is_lv_node[to_node]:
-                                base += START_PENALTY_LV_WITH_PA
-                            else:
-                                base += START_PENALTY_OTHER_WITH_PA
-                        elif any_lv_exists:
-                            # Sin PA pero con LV: LV mejor que otros
-                            if not is_lv_node[to_node]:
-                                base += START_PENALTY_OTHER_WITH_LV
-                        # Si no hay PA ni LV, nada especial
+                    # Prioridades SOLO aplican a clientes OTHER
+                    if node_group[to_node] == "OTHER":
+                        # Prioridad escalonada al salir del depósito
+                        if to_node != depot and from_node == depot:
+                            if any_pa_exists:
+                                # Con PA presente: PA (0), luego LV, luego TOTTUS, luego otros
+                                if is_pa_node[to_node]:
+                                    pass
+                                elif is_lv_node[to_node]:
+                                    base += START_PENALTY_LV_WITH_PA
+                                elif is_tottus_node[to_node]:
+                                    base += START_PENALTY_TOT_WITH_PA
+                                else:
+                                    base += START_PENALTY_OTHER_WITH_PA
+                            elif any_lv_exists:
+                                # Sin PA pero con LV: LV (0), luego TOTTUS, luego otros
+                                if is_lv_node[to_node]:
+                                    pass
+                                elif is_tottus_node[to_node]:
+                                    base += START_PENALTY_TOT_WITH_LV
+                                else:
+                                    base += START_PENALTY_OTHER_WITH_LV
+                            elif any_tottus_exists:
+                                # Solo TOTTUS presente: TOTTUS (0), luego otros
+                                if not is_tottus_node[to_node]:
+                                    base += START_PENALTY_OTHER_WITH_TOT
+                            # Si no hay ninguno, nada especial
 
-                    # Prioridad dentro de la ruta (entrada tardía)
+                        # Prioridad dentro de la ruta (entrada tardía)
+                        if from_node != depot and to_node != depot:
+                            # Entrar a PA después de algo que no es PA (incluye LV/TOTTUS/otros)
+                            if is_pa_node[to_node] and not is_pa_node[from_node]:
+                                base += PA_LATE_ENTRY_PENALTY
+
+                            # Entrar a LV después de un no-prioritario (ni PA ni LV ni TOTTUS)
+                            if is_lv_node[to_node] and (not is_lv_node[from_node] and not is_pa_node[from_node] and not is_tottus_node[from_node]):
+                                base += LV_LATE_ENTRY_PENALTY
+
+                            # Entrar a TOTTUS después de 'otros' (no PA/LV/TOTTUS)
+                            if is_tottus_node[to_node] and (not is_pa_node[from_node] and not is_lv_node[from_node] and not is_tottus_node[from_node]):
+                                base += TOT_LATE_ENTRY_PENALTY
+
+                            # Evitar PA después de LV/TOTTUS (preferimos PA antes que ambos)
+                            if is_lv_node[from_node] and is_pa_node[to_node]:
+                                base += PA_AFTER_LV_EXTRA_PENALTY
+                            if is_tottus_node[from_node] and is_pa_node[to_node]:
+                                base += PA_AFTER_TOT_EXTRA_PENALTY
+
+                            # Evitar LV después de TOTTUS (preferimos LV antes que TOTTUS)
+                            if is_tottus_node[from_node] and is_lv_node[to_node]:
+                                base += LV_AFTER_TOT_EXTRA_PENALTY
+
+                    # Penalización mezcla entre grupos (redundante con modos, pero inocua)
                     if from_node != depot and to_node != depot:
-                        # Entrar a PA después de algo que no es PA (incluye LV) = caro
-                        if is_pa_node[to_node] and not is_pa_node[from_node]:
-                            base += PA_LATE_ENTRY_PENALTY
-                        # Entrar a LV después de un no-prioritario = medio caro
-                        if is_lv_node[to_node] and (not is_lv_node[from_node] and not is_pa_node[from_node]):
-                            base += LV_LATE_ENTRY_PENALTY
-                        # Evitar PA después de LV en consecutivo
-                        if is_lv_node[from_node] and is_pa_node[to_node]:
-                            base += PA_AFTER_LV_EXTRA_PENALTY
-
-                        # Penalización mezcla (redundante con modos, pero inocua)
                         g_from, g_to = node_group[from_node], node_group[to_node]
                         if g_from != g_to and ("WALMART" in (g_from, g_to) or "CENCOSUD" in (g_from, g_to)):
                             base += HIGH_PENALTY

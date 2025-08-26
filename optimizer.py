@@ -154,7 +154,7 @@ def optimize():
         # ----------- Agrupador EXACTO (como pediste) -----------
         def _group(identificador: str) -> str:
             ident = (identificador or "").upper()
-            if any(k in ident for k in ["WALLMART CD"]):
+            if any(k in ident for k in ["WALMART CD"]):
                 return "WALMART"
             if any(k in ident for k in ["CENCOSUD CD"]):
                 return "CENCOSUD"

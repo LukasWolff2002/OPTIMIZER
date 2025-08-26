@@ -2,8 +2,17 @@ from flask import Flask, request, jsonify
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import copy
 import math
+import os  # <-- nuevo
 
 app = Flask(__name__)
+
+def _safe_set(obj, attr, value):
+    """Setea un atributo protobuf si existe; si no, lo ignora sin romper."""
+    try:
+        # Algunos protobufs validan tipos al asignar; si falla, no rompemos.
+        setattr(obj, attr, value)
+    except Exception:
+        pass
 
 @app.route("/optimize", methods=["POST"])
 def optimize():
@@ -181,21 +190,21 @@ def optimize():
             return is_tottus_node[i] or is_unimarc_node[i]
 
         # Pesos de penalización
-        START_PENALTY_OTHER_WITH_PA = 90_000   # con PA presente, empezar en 'otros'
-        START_PENALTY_TIER3_WITH_PA = 60_000   # con PA presente, empezar en TIER3 (TOTTUS/UNIMARC)
-        START_PENALTY_LV_WITH_PA    = 35_000   # con PA presente, empezar en LA VEGA
+        START_PENALTY_OTHER_WITH_PA = 90_000
+        START_PENALTY_TIER3_WITH_PA = 60_000
+        START_PENALTY_LV_WITH_PA    = 35_000
 
-        START_PENALTY_OTHER_WITH_LV = 60_000   # sin PA pero con LV, empezar en 'otros'
-        START_PENALTY_TIER3_WITH_LV = 25_000   # sin PA pero con LV, empezar en TIER3
+        START_PENALTY_OTHER_WITH_LV = 60_000
+        START_PENALTY_TIER3_WITH_LV = 25_000
 
-        START_PENALTY_OTHER_WITH_TIER3 = 45_000  # solo TIER3 presente, empezar en 'otros'
+        START_PENALTY_OTHER_WITH_TIER3 = 45_000
 
-        PA_LATE_ENTRY_PENALTY       = 100_000  # entrar a PA después de algo que no es PA
-        LV_LATE_ENTRY_PENALTY       = 70_000   # entrar a LV después de un no-prioritario (ni PA/LV/TIER3)
-        TIER3_LATE_ENTRY_PENALTY    = 45_000   # entrar a TIER3 después de 'otros'
+        PA_LATE_ENTRY_PENALTY       = 100_000
+        LV_LATE_ENTRY_PENALTY       = 70_000
+        TIER3_LATE_ENTRY_PENALTY    = 45_000
 
-        PA_AFTER_TIER3_EXTRA_PENALTY = 70_000  # evitar TIER3 -> PA
-        LV_AFTER_TIER3_EXTRA_PENALTY = 40_000  # evitar TIER3 -> LV
+        PA_AFTER_TIER3_EXTRA_PENALTY = 70_000
+        LV_AFTER_TIER3_EXTRA_PENALTY = 40_000
 
         # Extensión de matrices
         def extend_matrix(base_matrix):
@@ -210,15 +219,12 @@ def optimize():
         extended_distance_matrix = extend_matrix(distance_matrix)
         extended_time_matrix = extend_matrix(time_matrix) if time_matrix else None
 
-        # Si no hay matriz de tiempo, no se puede imponer el tope global de 480 min
         if extended_time_matrix is None:
             return jsonify(error="Se requiere 'time_matrix' para limitar el tiempo total por vehículo a 480 minutos."), 400
 
         # OR-Tools
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
-
-        # --- RESTRICCIONES DURAS ---
 
         # (a) Refrigeración
         for node_index in range(1, num_nodes):
@@ -236,7 +242,7 @@ def optimize():
                 allowed_modes = {MODE_W}
             elif g == "CENCOSUD":
                 allowed_modes = {MODE_C}
-            else:  # OTHER
+            else:
                 allowed_modes = {MODE_FREE}
             for v in range(num_vehicles):
                 if vehicle_mode[v] not in allowed_modes:
@@ -251,12 +257,10 @@ def optimize():
                     base_dist = extended_distance_matrix[from_node][to_node]
                     base = max(0, int(round((base_dist / max(rate, 1e-9)) * 1000)))
 
-                    # Prioridades SOLO aplican a clientes OTHER
                     if node_group[to_node] == "OTHER":
                         # Al salir del depósito
                         if to_node != depot and from_node == depot:
                             if any_pa_exists:
-                                # Preferimos PA > LV > TIER3 > otros
                                 if is_pa_node[to_node]:
                                     pass
                                 elif is_lv_node[to_node]:
@@ -266,7 +270,6 @@ def optimize():
                                 else:
                                     base += START_PENALTY_OTHER_WITH_PA
                             elif any_lv_exists:
-                                # Sin PA pero con LV: LV > TIER3 > otros
                                 if is_lv_node[to_node]:
                                     pass
                                 elif is_tier3(to_node):
@@ -274,30 +277,23 @@ def optimize():
                                 else:
                                     base += START_PENALTY_OTHER_WITH_LV
                             elif any_tier3_exists:
-                                # Solo TIER3: TIER3 > otros
                                 if not is_tier3(to_node):
                                     base += START_PENALTY_OTHER_WITH_TIER3
-                            # Si no hay ninguno, nada especial
 
                         # Dentro de la ruta
                         if from_node != depot and to_node != depot:
-                            # Entrar a PA tardíamente
                             if is_pa_node[to_node] and not is_pa_node[from_node]:
                                 base += PA_LATE_ENTRY_PENALTY
-                            # Entrar a LV desde no-prioritario (ni PA/LV/TIER3)
                             if is_lv_node[to_node] and (not is_lv_node[from_node] and not is_pa_node[from_node] and not is_tier3(from_node)):
                                 base += LV_LATE_ENTRY_PENALTY
-                            # Entrar a TIER3 desde 'otros' (no PA/LV/TIER3)
                             if is_tier3(to_node) and (not is_pa_node[from_node] and not is_lv_node[from_node] and not is_tier3(from_node)):
                                 base += TIER3_LATE_ENTRY_PENALTY
-
-                            # Evitar TIER3 -> PA / TIER3 -> LV (preferimos PA y luego LV antes)
                             if is_tier3(from_node) and is_pa_node[to_node]:
                                 base += PA_AFTER_TIER3_EXTRA_PENALTY
                             if is_tier3(from_node) and is_lv_node[to_node]:
                                 base += LV_AFTER_TIER3_EXTRA_PENALTY
 
-                    # Penalización mezcla entre grupos (redundante con modos, pero inocua)
+                    # Mezcla (redundante con modos)
                     if from_node != depot and to_node != depot:
                         g_from, g_to = node_group[from_node], node_group[to_node]
                         if g_from != g_to and ("WALMART" in (g_from, g_to) or "CENCOSUD" in (g_from, g_to)):
@@ -372,6 +368,22 @@ def optimize():
         search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         search_parameters.time_limit.FromSeconds(tiempo_calculo)
+
+        # ----- MULTIHILO DEL SOLVER (asignación segura) -----
+        req_workers = data.get("search_workers")
+        if req_workers is None:
+            req_workers = os.environ.get("ORTOOLS_WORKERS")
+        try:
+            req_workers = int(req_workers) if req_workers is not None else 0
+        except Exception:
+            req_workers = 0
+        if req_workers <= 0:
+            req_workers = min(32, os.cpu_count() or 1)
+        _safe_set(search_parameters, "number_of_workers", req_workers)
+
+        # Log de búsqueda opcional
+        _safe_set(search_parameters, "log_search", bool(data.get("log_search", False)))
+        # -----------------------------------------------------
 
         solution = routing.SolveWithParameters(search_parameters)
         if not solution:
@@ -503,7 +515,10 @@ def optimize():
 
     except Exception as e:
         import traceback
+        # Además del JSON, imprime al log del contenedor para ver en Railway
+        traceback.print_exc()
         return jsonify(error=f"Error interno: {str(e)}", traceback=traceback.format_exc()), 500
 
 if __name__ == "__main__":
+    # En Railway, usa Gunicorn. Esto es solo para local.
     app.run(host="0.0.0.0", port=3000, debug=False)

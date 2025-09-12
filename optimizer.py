@@ -50,10 +50,23 @@ def optimize():
         locations = data["locations"]
         base_num_vehicles = data["max_vehicles"]
         vehicle_capacities_base = data["vehicle_capacities"]
+        vehicle_palets_base = data.get("vehicle_palets", [0]*base_num_vehicles)
         vehicle_consume_base = data.get("vehicle_consume", [1]*base_num_vehicles)
         vehicle_free_base = data.get("vehicle_free", [0]*base_num_vehicles)
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
+        multiplicador_tiempo = float(data.get("multiplicador_tiempo", 1.0) or 1.0)
+
+        if len(vehicle_palets_base) != base_num_vehicles:
+            return jsonify(error="La cantidad de palets por vehículo no coincide con max_vehicles"), 400
+
+        PALLET_INF = 10**9
+        try:
+            vehicle_palets_base = [int(p) for p in vehicle_palets_base]
+        except Exception:
+            return jsonify(error="vehicle_palets debe ser una lista de enteros"), 400
+
+        vehicle_palets_base = [ (p if p > 0 else PALLET_INF) for p in vehicle_palets_base ]
 
         # tiempos
         tiempo_calculo_min = data.get("tiempo_calculo", 2)  # minutos (default 2)
@@ -85,6 +98,7 @@ def optimize():
         vehicle_mapping = {}   # dup idx -> camión base
         vehicle_trip_no = {}   # dup idx -> 0 ó 1
         vehicle_mode = {}      # dup idx -> modo
+        vehicle_palets = []  # NUEVO
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
@@ -92,6 +106,7 @@ def optimize():
                     vehicle_capacities.append(vehicle_capacities_base[idx])
                     vehicle_consume.append(vehicle_consume_base[idx])
                     vehicle_free.append(vehicle_free_base[idx])
+                    vehicle_palets.append(vehicle_palets_base[idx])  # NUEVO
                     v_idx = len(vehicle_capacities) - 1
                     vehicle_mapping[v_idx] = idx
                     vehicle_trip_no[v_idx] = trip
@@ -110,12 +125,16 @@ def optimize():
         # Generar nodos extendidos
         extended_locations = [locations[0]]
         extended_demands = [0]  # demanda total
+        extended_palets = [0]  # depósito usa 0
+
         split_mapping = {}
         extended_requires_refrigeration = [False]  # depósito no requiere
 
         for idx, loc in enumerate(locations[1:], start=1):
             prod_quantities = {p: int(float(loc.get("demanda", {}).get(p, 0))) for p in all_products}
             total_demand = sum(prod_quantities.values())
+            palets_total = int(float(loc.get("palets_en_suelo", 0) or 0))
+
 
             identificador = (loc.get("identificador", "") or "").upper()
             requires_refrigeration = any(nombre.upper() in identificador for nombre in ubicaciones_refrigeradas)
@@ -125,10 +144,13 @@ def optimize():
                 extended_demands.append(int(total_demand))
                 split_mapping[len(extended_locations)-1] = idx
                 extended_requires_refrigeration.append(requires_refrigeration)
+                extended_palets.append(palets_total)  # NUEVO
+
             else:
                 proportions = {p: (q / total_demand) if total_demand > 0 else 0 for p, q in prod_quantities.items()}
                 remaining = total_demand
                 remaining_per_product = prod_quantities.copy()
+                remaining_palets = palets_total
                 while remaining > 0:
                     amount = min(remaining, max_vehicle_capacity)
                     split_loc = copy.deepcopy(loc)
@@ -139,15 +161,23 @@ def optimize():
                             q = min(q, remaining_per_product[p])
                             split_demand[p] = q
                             remaining_per_product[p] -= q
+
+                        frac = amount / max(remaining, 1)
+                        palets_assigned = int(round(frac * remaining_palets))
+                        palets_assigned = min(palets_assigned, remaining_palets)
                     else:
                         split_demand = remaining_per_product.copy()
+                        palets_assigned = remaining_palets
 
                     split_loc["demanda"] = {p: str(split_demand[p]) for p in all_products if split_demand[p] > 0}
                     extended_locations.append(split_loc)
                     extended_demands.append(int(sum(split_demand.values())))
                     split_mapping[len(extended_locations)-1] = idx
                     extended_requires_refrigeration.append(requires_refrigeration)
+                    extended_palets.append(int(palets_assigned))  # NUEVO
+
                     remaining -= amount
+                    remaining_palets -= palets_assigned
 
         num_nodes = len(extended_locations)
 
@@ -221,6 +251,13 @@ def optimize():
 
         if extended_time_matrix is None:
             return jsonify(error="Se requiere 'time_matrix' para limitar el tiempo total por vehículo a 480 minutos."), 400
+        
+        # ⬇️ Escalar TODA la matriz de tiempos (mantener float; se redondea en el callback)
+        if multiplicador_tiempo != 1.0:
+            extended_time_matrix = [
+                [cell * multiplicador_tiempo for cell in row]
+                for row in extended_time_matrix
+            ]
 
         # OR-Tools
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
@@ -317,6 +354,26 @@ def optimize():
             True,
             "Capacity"
         )
+
+        # ======= Dimensión de Palets (capacidad independiente) =======
+        def palet_demand_callback(from_index):
+            node = manager.IndexToNode(from_index)
+            return int(extended_palets[node])
+
+        palet_cb_idx = routing.RegisterUnaryTransitCallback(palet_demand_callback)
+
+        routing.AddDimensionWithVehicleCapacity(
+            palet_cb_idx,
+            0,                   # no slack
+            vehicle_palets,      # capacidad por vehículo duplicado
+            True,                # start cumul at zero
+            "Palets"
+        )
+        palet_dimension = routing.GetDimensionOrDie("Palets")
+        # (Opcional) límites por nodo: aquí no hace falta poner rango adicional,
+        # la capacidad por vehículo ya restringe el total acumulado.
+        # =============================================================
+
 
         # Tiempo (con servicio de recarga al salir del depósito en medio de ruta)
         start_indices = set(routing.Start(v) for v in range(num_vehicles))
@@ -446,13 +503,16 @@ def optimize():
                             "subtotal": round(subtotal, 2)
                         })
 
+                    stop_palets = extended_palets[node]  # palets para esta sub-parada
+
                     deliveries.append({
                         "location_id": loc_id,
                         "node_index": node,
                         "products": demanda,
                         "products_detail": products_detail,
                         "totals": {"kg": round(stop_kg, 2),
-                                   "units": (round(stop_units, 2) if stop_units > 0 else None)}
+                                   "units": (round(stop_units, 2) if stop_units > 0 else None),
+                                   "palets": int(stop_palets) }
                     })
 
                 prev = index
@@ -478,13 +538,16 @@ def optimize():
                 if not (n == 0 and cleaned[-1] == 0):
                     cleaned.append(n)
 
+            trip_palets = sum(int(d["totals"].get("palets", 0)) for d in deliveries if d.get("totals"))
+
             agg = vehicle_trips.setdefault(main_vehicle, {
                 "vehicle": main_vehicle,
                 "trips": [],
                 "total_distance": 0.0,
                 "total_fuel_liters": 0.0,
                 "total_kg": 0.0,
-                "total_units": 0.0
+                "total_units": 0.0,
+                "total_palets": 0  # NUEVO
             })
 
             agg["trips"].append({
@@ -494,13 +557,15 @@ def optimize():
                 "distance": dist_v,
                 "fuel_liters": fuel,
                 "total_kg": round(trip_kg, 2),
-                "total_units": (round(trip_units, 2) if trip_units > 0 else None)
+                "total_units": (round(trip_units, 2) if trip_units > 0 else None),
+                "total_palets": int(trip_palets)  # NUEVO
             })
 
             agg["total_distance"] += dist_v
             agg["total_fuel_liters"] += fuel
             agg["total_kg"] += trip_kg
             agg["total_units"] += trip_units
+            agg["total_palets"] += int(trip_palets)
 
             total_kg += trip_kg
             total_units += trip_units

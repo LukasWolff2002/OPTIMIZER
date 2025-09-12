@@ -57,6 +57,8 @@ def optimize():
         time_matrix = data.get("time_matrix")
         multiplicador_tiempo = float(data.get("multiplicador_tiempo", 1.0) or 1.0)
 
+        maximo_de_paradas = int(data.get("maximas_paradas_camion", 100))
+
         if len(vehicle_palets_base) != base_num_vehicles:
             return jsonify(error="La cantidad de palets por vehículo no coincide con max_vehicles"), 400
 
@@ -403,6 +405,30 @@ def optimize():
             time_dimension.CumulVar(idx).SetRange(0, HORIZON)
         for v in range(num_vehicles):
             time_dimension.CumulVar(routing.End(v)).SetMax(HORIZON)
+
+        # ======= Dimensión de Paradas =======
+        def stop_callback(from_index, to_index):
+            """Cuenta 1 cada vez que se visita un nodo distinto del depósito."""
+            from_node = manager.IndexToNode(from_index)
+            to_node = manager.IndexToNode(to_index)
+            # Cada transición desde un nodo != depósito suma 1
+            return 1 if to_node != depot else 0
+
+        stop_cb_idx = routing.RegisterTransitCallback(stop_callback)
+
+        routing.AddDimension(
+            stop_cb_idx,
+            0,                      # slack
+            maximo_de_paradas,      # capacidad máxima de paradas por vehículo
+            True,                   # start cumul = 0
+            "Stops"
+        )
+        stops_dimension = routing.GetDimensionOrDie("Stops")
+
+        # Tope duro por vehículo
+        for v in range(num_vehicles):
+            stops_dimension.CumulVar(routing.End(v)).SetMax(maximo_de_paradas)
+
 
         # Tope GLOBAL por vehículo real = suma de tiempos de sus duplicados <= HORIZON
         solver = routing.solver()

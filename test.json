@@ -8,6 +8,7 @@ curl -X POST http://localhost:3000/optimize \
         "lat": -32.880417,
         "lng": -71.24946299999999,
         "identificador": "PACKING",
+        "arrival_time": null,
         "demanda": {
         },
         "precios": {
@@ -20,30 +21,11 @@ curl -X POST http://localhost:3000/optimize \
         "palets_en_suelo": 0
       },
       {
-        "id": 4,
-        "lat": -32.9394663,
-        "lng": -71.5463031,
-        "identificador": "C CD",
-        "demanda": {
-          "4": 20.0
-        },
-        "precios": {
-          "4": 11.0
-        },
-        "pesos": {
-          "4": 1.0
-        },
-        "unidades": {
-          "4": 1
-        },
-        "wait_minutes": 60.0,
-        "palets_en_suelo": 1
-      },
-      {
         "id": 5,
         "lat": -33.357108,
         "lng": -70.514393,
         "identificador": "JUMBO LOCAL",
+        "arrival_time": "2000-01-01T04:30:00.000-10:00",
         "demanda": {
           "2": 20.0
         },
@@ -64,8 +46,9 @@ curl -X POST http://localhost:3000/optimize \
         "lat": -33.4488897,
         "lng": -70.6692655,
         "identificador": "PUNTO AZUL",
+        "arrival_time": null,
         "demanda": {
-          "5": 2.0
+          "5": 1.0
         },
         "precios": {
           "5": 1000.0
@@ -83,25 +66,16 @@ curl -X POST http://localhost:3000/optimize \
     "distance_matrix": [
       [
         0,
-        33,
         135,
         125
       ],
       [
-        33,
-        0,
-        158,
-        136
-      ],
-      [
         138,
-        156,
         0,
         22
       ],
       [
         125,
-        135,
         22,
         0
       ]
@@ -109,25 +83,16 @@ curl -X POST http://localhost:3000/optimize \
     "time_matrix": [
       [
         0,
-        54.86,
         117.96,
         110.1
       ],
       [
-        54.68,
-        0,
-        139.32,
-        128.45999999999998
-      ],
-      [
         117.03999999999999,
-        137.64,
         0,
         31.22
       ],
       [
         110.49999999999999,
-        126.86,
         31.379999999999995,
         0
       ]
@@ -153,9 +118,10 @@ curl -X POST http://localhost:3000/optimize \
       1,
       1
     ],
-    "tiempo_calculo": 1,
-    "maximas_paradas_camion": 7,
-    "multiplicador_tiempo": 1.0
+    "tiempo_calculo": 0.1,
+    "maximas_paradas_camion": 3,
+    "multiplicador_tiempo": 1.0,
+    "departure_time": "01:00"
   },
   [
     1,

@@ -1,0 +1,45 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[spanish]{babel}
+
+\title{Modelo de Optimización de Rutas de Camiones}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Objetivo del modelo}
+El propósito del modelo es planificar las rutas de los camiones que salen del \textbf{packing} para entregar pedidos a distintos clientes.  
+Se busca generar un plan de recorridos que:
+\begin{itemize}
+  \item Minimice el uso de recursos (combustible).
+  \item Cumpla con todas las restricciones solicitadas, las cuales se detallan a continuación.
+\end{itemize}
+
+\section*{Restricciones consideradas}
+Para garantizar que las rutas propuestas sean realistas, el modelo incorpora las siguientes restricciones:
+\begin{itemize}
+  \item \textbf{Capacidad de carga}: cada camión tiene un límite máximo en kilos y en número de palets transportables, las cuales son restricciones independientes entre sí.
+  \item \textbf{Tiempo máximo de conducción}: ningún camión puede conducir más de un cierto número de minutos (8 horas de viaje).
+  \item \textbf{Ventanas de entrega}: algunos clientes cuentan con una hora máxima de llegada para recibir su pedido.
+  \item \textbf{Tiempos de espera}: al llegar a un cliente, el camión debe permanecer detenido un tiempo determinado antes de poder continuar la ruta.
+  \item \textbf{Número máximo de paradas}: cada camión puede realizar sólo un número limitado de entregas antes de regresar al depósito.
+  \item \textbf{Compatibilidad de vehículos}: ciertos clientes requieren camiones refrigerados, por lo que no cualquier vehículo puede atenderlos.
+  \item \textbf{Exclusividad de grupos}: algunos grupos de clientes no pueden mezclarse en la misma ruta (WALMART y CENCOSUD).
+  \item \textbf{Prioridad de clientes}: existen tres niveles de prioridad en la atención:
+  \begin{enumerate}
+    \item \textbf{Primera} ---  \emph{Punto Azul}
+    \item \textbf{Segunda} --- \emph{La Vega}
+    \item \textbf{Tercera} --- \emph{Tottus CD} o \emph{Unimarc CD}
+    \item \textbf{Cuarta} --- Resto de clientes
+  \end{enumerate}
+\end{itemize}
+
+\section*{Consideraciones adicionales}
+\begin{itemize}
+  \item Si la demanda de un cliente supera la capacidad de un solo camión, éste puede ser atendido por más de un vehículo.
+  \item Cada camión puede realizar como máximo dos salidas desde el packing, siempre que no se exceda el tiempo máximo de conducción permitido.
+  \item En los casos donde un cliente con restricción horaria debe ser atendido antes que uno con mayor prioridad, el modelo puede asignar dos camiones distintos para cumplir simultáneamente ambas condiciones.
+\end{itemize}
+
+\end{document}

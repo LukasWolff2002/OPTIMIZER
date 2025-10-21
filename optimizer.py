@@ -90,7 +90,7 @@ def optimize():
         # tiempos (min)
         tiempo_calculo_min = float(data.get("tiempo_calculo", 2))  # minutos
         tiempo_calculo = int(tiempo_calculo_min * 60)              # segundos
-        HORIZON = int(data.get("max_time_per_trip", 480))          # tope de conducción (Drive)
+        HORIZON = int(data.get("max_time_per_trip", 600))          # tope de conducción (Drive)
         reload_service_time = int(data.get("reload_service_time", 0))
 
         # Ventanas: hora de salida común (t=0)

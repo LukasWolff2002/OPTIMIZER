@@ -5,8 +5,8 @@ curl -X POST http://localhost:3000/optimize \
     "locations": [
       {
         "id": 1,
-        "lat": -32.880417,
-        "lng": -71.24946299999999,
+        "lat": -32.8721275,
+        "lng": -71.2080314,
         "identificador": "PACKING",
         "arrival_time": null,
         "demanda": {
@@ -21,113 +21,211 @@ curl -X POST http://localhost:3000/optimize \
         "palets_en_suelo": 0
       },
       {
-        "id": 5,
-        "lat": -33.357108,
-        "lng": -70.514393,
-        "identificador": "JUMBO LOCAL",
-        "arrival_time": "2000-01-01T04:30:00.000-10:00",
+        "id": 70,
+        "lat": -33.3729829,
+        "lng": -70.74902399999999,
+        "identificador": "TOTTUS CD",
+        "arrival_time": null,
         "demanda": {
-          "2": 20.0
+          "253": 196.0,
+          "240": 196.0
         },
         "precios": {
-          "2": 1.0
+          "253": 10000.0,
+          "240": 11500.0
         },
         "pesos": {
-          "2": 20.0
+          "253": 3.92,
+          "240": 3.92
         },
         "unidades": {
-          "2": 10
+          "253": 10,
+          "240": 10
         },
-        "wait_minutes": 60.0,
+        "wait_minutes": 137.02810581629032,
+        "palets_en_suelo": 2
+      },
+      {
+        "id": 89,
+        "lat": -33.5979953,
+        "lng": -70.513579,
+        "identificador": "SANTA ISABEL LOCAL",
+        "arrival_time": null,
+        "demanda": {
+          "250": 15.66,
+          "228": 65.19999999999999
+        },
+        "precios": {
+          "250": 16388.0,
+          "228": 20468.0
+        },
+        "pesos": {
+          "250": 5.22,
+          "228": 6.52
+        },
+        "unidades": {
+          "250": 15,
+          "228": 1
+        },
+        "wait_minutes": 40.24853263636477,
         "palets_en_suelo": 1
       },
       {
-        "id": 7,
-        "lat": -33.4488897,
-        "lng": -70.6692655,
-        "identificador": "PUNTO AZUL",
+        "id": 106,
+        "lat": -33.510324,
+        "lng": -70.6069152,
+        "identificador": "JUMBO LOCAL",
         "arrival_time": null,
         "demanda": {
-          "5": 1.0
+          "114": 213.0,
+          "251": 52.199999999999996,
+          "108": 163.0
         },
         "precios": {
-          "5": 1000.0
+          "114": 10906.0,
+          "251": 16388.0,
+          "108": 20468.0
         },
         "pesos": {
-          "5": 1.0
+          "114": 8.52,
+          "251": 5.22,
+          "108": 6.52
         },
         "unidades": {
-          "5": 1
+          "114": 1,
+          "251": 15,
+          "108": 1
         },
-        "wait_minutes": 30.0,
+        "wait_minutes": 41.16841084232277,
+        "palets_en_suelo": 1
+      },
+      {
+        "id": 109,
+        "lat": -33.48045159999999,
+        "lng": -70.75015979999999,
+        "identificador": "JUMBO LOCAL",
+        "arrival_time": null,
+        "demanda": {
+          "114": 25.56,
+          "251": 31.32,
+          "108": 130.39999999999998
+        },
+        "precios": {
+          "114": 10906.0,
+          "251": 16388.0,
+          "108": 20468.0
+        },
+        "pesos": {
+          "114": 8.52,
+          "251": 5.22,
+          "108": 6.52
+        },
+        "unidades": {
+          "114": 1,
+          "251": 15,
+          "108": 1
+        },
+        "wait_minutes": 63.25251602401736,
         "palets_en_suelo": 1
       }
     ],
     "distance_matrix": [
       [
         0,
-        135,
-        125
+        119,
+        156,
+        137,
+        133
+      ],
+      [
+        121,
+        0,
+        44,
+        27,
+        15
+      ],
+      [
+        156,
+        46,
+        0,
+        15,
+        30
       ],
       [
         138,
+        37,
+        14,
         0,
         22
       ],
       [
-        125,
-        22,
+        136,
+        17,
+        30,
+        21,
         0
       ]
     ],
     "time_matrix": [
       [
         0,
-        117.96,
-        110.1
+        99.88,
+        145.44,
+        122.69999999999999,
+        111.58
       ],
       [
-        117.03999999999999,
+        102.56,
         0,
-        31.22
+        57.54,
+        38.3,
+        18.56
       ],
       [
-        110.49999999999999,
-        31.379999999999995,
+        146.45999999999998,
+        58.22,
+        0,
+        36.58,
+        45.199999999999996
+      ],
+      [
+        124.8,
+        39.8,
+        34.64,
+        0,
+        26.76
+      ],
+      [
+        114.76,
+        20.34,
+        45.76,
+        27.56,
         0
       ]
     ],
-    "max_vehicles": 2,
+    "max_vehicles": 1,
     "vehicle_capacities": [
-      1000,
-      1000
+      4500
     ],
     "vehicle_palets": [
-      5,
-      10
+      7
     ],
     "vehicle_interno": [
-      1,
       1
     ],
     "vehicle_consume": [
-      10.0,
-      5.0
+      5.4
     ],
     "vehicle_free": [
-      1,
       1
     ],
     "tiempo_calculo": 0.1,
-    "maximas_paradas_camion": 3,
-    "multiplicador_tiempo": 1.0,
-    "departure_time": "01:00"
+    "maximas_paradas_camion": 5,
+    "multiplicador_tiempo": 1.2,
+    "departure_time": "04:00"
   },
   [
-    1,
-    3
+    7
   ],
-  1
-]
-'
-
+  331
+]'

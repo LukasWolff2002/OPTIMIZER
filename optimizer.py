@@ -129,7 +129,7 @@ def optimize():
         # -------------------- Duplicación de vehículos ----------------------------
         vehicle_capacities, vehicle_consume, vehicle_free, vehicle_palets = [], [], [], []
         vehicle_mapping, vehicle_trip_no, vehicle_mode = {}, {}, {}
-        max_trips_per_vehicle = 2  # viajes por camión (0,1)
+        max_trips_per_vehicle = 1  # viajes por camión (0,1)
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):

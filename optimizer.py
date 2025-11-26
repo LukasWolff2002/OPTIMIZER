@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import copy
-import math
 import os
 from datetime import datetime
 
@@ -43,8 +42,8 @@ def optimize():
       - Dos dimensiones de tiempo:
          * Time  = viaje + espera + reload  [para ventanas/secuenciación]
          * Drive = SOLO viaje               [para tope de 8h]
-      - Ventanas: 'departure_time' (HH:MM) + 'arrival_time' (ISO c/tz) por nodo
-        ⇒ 'llegada + wait <= deadline' relativo a departure_time
+      - Ventanas: 'departure_time' (HH:MM) + 'open_time'/'arrival_time' (ISO/HH:MM) por nodo
+        ⇒ open_time - gap_time <= llegada <= (close_time - gap_time - wait) relativo a departure_time
       - Límite de paradas por vehículo (Stops)
     """
     # ---------------------- Datos fijos de negocio ---------------------
@@ -129,7 +128,7 @@ def optimize():
         # -------------------- Duplicación de vehículos ----------------------------
         vehicle_capacities, vehicle_consume, vehicle_free, vehicle_palets = [], [], [], []
         vehicle_mapping, vehicle_trip_no, vehicle_mode = {}, {}, {}
-        max_trips_per_vehicle = 1 #2 # viajes por camión (0,1)
+        max_trips_per_vehicle = 1  # si quieres 2 viajes, cambiar a 2
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
@@ -161,6 +160,7 @@ def optimize():
         extended_wait        = [0.0]      # min
         extended_deadline    = [None]     # min relativo a t=0
         extended_opening     = [None]     # min relativo a t=0 (apertura)
+        extended_gap         = [0]        # gap_time por nodo (min)
         extended_refrigerate = [False]    # flag
         split_mapping        = {}         # idx extendido -> idx original
 
@@ -186,6 +186,11 @@ def optimize():
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
 
+            # Gap por ubicación (min) -> mismo para apertura y cierre
+            gap_time = int(loc.get("gap_time", 0) or 0)
+            if gap_time < 0:
+                gap_time = 0
+
             # Deadline relativo si hay arrival_time + departure_time
             arrival_time_iso = loc.get("arrival_time")
             deadline_minutes_rel = None
@@ -200,7 +205,7 @@ def optimize():
                 except Exception:
                     deadline_minutes_rel = None
 
-            # Apertura relativa si hay open_time + departure_time  👈 NUEVO
+            # Apertura relativa si hay open_time + departure_time
             open_time_raw = loc.get("open_time")
             opening_minutes_rel = None
             if departure_minutes0 is not None and open_time_raw:
@@ -219,10 +224,11 @@ def optimize():
                 except Exception:
                     opening_minutes_rel = None
 
-
             # Refrigeración por identificador
             identificador = (loc.get("identificador", "") or "").upper()
-            requires_refrigeration = any(name in identificador for name in [s.upper() for s in ubicaciones_refrigeradas])
+            requires_refrigeration = any(
+                name in identificador for name in [s.upper() for s in ubicaciones_refrigeradas]
+            )
 
             # Split si excede capacidad de kg
             if total_demand <= max_vehicle_capacity:
@@ -232,6 +238,7 @@ def optimize():
                 extended_wait.append(wait_minutes)
                 extended_deadline.append(deadline_minutes_rel)
                 extended_opening.append(opening_minutes_rel)
+                extended_gap.append(gap_time)
                 extended_refrigerate.append(requires_refrigeration)
                 split_mapping[len(extended_locations) - 1] = idx_loc
             else:
@@ -257,14 +264,17 @@ def optimize():
                         split_demand = remaining_per_product.copy()
                         palets_assigned = remaining_palets
 
-                    split_loc["demanda"] = {p: str(split_demand[p]) for p in all_products if split_demand[p] > 0}
+                    split_loc["demanda"] = {
+                        p: str(split_demand[p]) for p in all_products if split_demand[p] > 0
+                    }
 
                     extended_locations.append(split_loc)
                     extended_demands.append(int(sum(split_demand.values())))
                     extended_palets.append(int(palets_assigned))
                     extended_wait.append(wait_minutes)              # hereda
                     extended_deadline.append(deadline_minutes_rel)  # hereda
-                    extended_opening.append(opening_minutes_rel)       # hereda
+                    extended_opening.append(opening_minutes_rel)    # hereda
+                    extended_gap.append(gap_time)                   # hereda
                     extended_refrigerate.append(requires_refrigeration)
                     split_mapping[len(extended_locations) - 1] = idx_loc
 
@@ -326,7 +336,6 @@ def optimize():
                     routing.VehicleVar(node_idx).RemoveValue(v)
 
         # (c) Costos (combustible + penalizaciones de prioridad)
-        #    Nota: conservamos tu lógica de penalizaciones
         HIGH_PENALTY = 100_000
         prioridad_pa_tag = "PUNTO AZUL"
         prioridad_lv_tag = "LA VEGA"
@@ -342,9 +351,12 @@ def optimize():
             is_unimarc_node.append(prioridad_unimarc_tag in ident)
         any_pa_exists = any(is_pa_node[1:])
         any_lv_exists = any(is_lv_node[1:])
-        any_tier3_exists = any((is_tottus_node[i] or is_unimarc_node[i]) for i in range(1, len(is_tottus_node)))
+        any_tier3_exists = any(
+            (is_tottus_node[i] or is_unimarc_node[i]) for i in range(1, len(is_tottus_node))
+        )
 
-        def is_tier3(i): return is_tottus_node[i] or is_unimarc_node[i]
+        def is_tier3(i):
+            return is_tottus_node[i] or is_unimarc_node[i]
 
         START_PENALTY_OTHER_WITH_PA = 90_000
         START_PENALTY_TIER3_WITH_PA = 60_000
@@ -390,9 +402,17 @@ def optimize():
                         if from_node != depot and to_node != depot:
                             if is_pa_node[to_node] and not is_pa_node[from_node]:
                                 base += PA_LATE_ENTRY_PENALTY
-                            if is_lv_node[to_node] and (not is_lv_node[from_node] and not is_pa_node[from_node] and not is_tier3(from_node)):
+                            if is_lv_node[to_node] and (
+                                not is_lv_node[from_node]
+                                and not is_pa_node[from_node]
+                                and not is_tier3(from_node)
+                            ):
                                 base += LV_LATE_ENTRY_PENALTY
-                            if is_tier3(to_node) and (not is_pa_node[from_node] and not is_lv_node[from_node] and not is_tier3(from_node)):
+                            if is_tier3(to_node) and (
+                                not is_pa_node[from_node]
+                                and not is_lv_node[from_node]
+                                and not is_tier3(from_node)
+                            ):
                                 base += TIER3_LATE_ENTRY_PENALTY
                             if is_tier3(from_node) and is_pa_node[to_node]:
                                 base += PA_AFTER_TIER3_EXTRA_PENALTY
@@ -415,18 +435,23 @@ def optimize():
             node = manager.IndexToNode(from_index)
             return int(extended_demands[node])
         demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-        routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, vehicle_capacities, True, "Capacity")
+        routing.AddDimensionWithVehicleCapacity(
+            demand_callback_index, 0, vehicle_capacities, True, "Capacity"
+        )
 
         # Palets
         def palet_demand_callback(from_index):
             node = manager.IndexToNode(from_index)
             return int(extended_palets[node])
         palet_cb_idx = routing.RegisterUnaryTransitCallback(palet_demand_callback)
-        routing.AddDimensionWithVehicleCapacity(palet_cb_idx, 0, vehicle_palets, True, "Palets")
+        routing.AddDimensionWithVehicleCapacity(
+            palet_cb_idx, 0, vehicle_palets, True, "Palets"
+        )
 
         # ------------------------ Dimensiones de tiempo ----------------------------
         # Time (viaje + espera + reload) ⇒ ventanas y secuenciación
         start_indices = set(routing.Start(v) for v in range(num_vehicles))
+
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node   = manager.IndexToNode(to_index)
@@ -437,44 +462,46 @@ def optimize():
             if from_node != depot:
                 service += int(round(extended_wait[from_node]))
             return travel + service
+
         time_cb = routing.RegisterTransitCallback(time_callback)
         routing.AddDimension(time_cb, 0, 10**7, True, "Time")
         time_dimension = routing.GetDimensionOrDie("Time")
 
-        # Ventanas: llegada + espera <= deadline
-        # Ventanas: open_time <= arrival <= (deadline - wait)
+        # Ventanas: open_time - gap <= arrival <= (deadline - gap - wait)
         if departure_minutes0 is not None:
             for node in range(1, num_nodes):
                 idx = manager.NodeToIndex(node)
-                lb = 0           # lower bound por defecto
-                ub = 10**7       # upper bound muy grande por defecto
+                lb = 0          # lower bound por defecto (sin apertura)
+                ub = 10**7      # upper bound muy grande por defecto
 
-                # Límite inferior: apertura
+                gap_here = int(extended_gap[node]) if extended_gap[node] is not None else 0
+                if gap_here < 0:
+                    gap_here = 0
+
+                # Límite inferior: apertura desplazada hacia atrás por gap
                 if extended_opening[node] is not None:
-                    lb = max(lb, int(extended_opening[node]))
+                    eff_open = int(extended_opening[node]) - gap_here
+                    lb = max(lb, max(0, eff_open))
 
-                # Límite superior: deadline - wait
+                # Límite superior: cierre desplazado hacia atrás por gap
                 if extended_deadline[node] is not None:
                     wait_here = int(round(extended_wait[node]))
-                    ub = min(ub, max(0, int(extended_deadline[node]) - wait_here))
+                    eff_deadline = int(extended_deadline[node]) - gap_here
+                    ub_deadline = eff_deadline - wait_here
+                    ub = min(ub, max(0, ub_deadline))
 
-                # Si solo hay apertura, ub queda grande; si solo hay cierre, lb=0.
-                # Si ambas, tenemos ventana [lb, ub].
                 if lb <= ub:
                     time_dimension.CumulVar(idx).SetRange(lb, ub)
                 else:
-                    # Ventana inconsistente → lo puedes manejar como error si prefieres
-                    # Por ahora fijamos lb==ub para forzar llegada exacta (hará el problema probablemente infactible)
+                    # ventana inconsistente → se fuerza a un valor imposible (hará el problema infactible)
                     time_dimension.CumulVar(idx).SetRange(lb, lb)
-                    # Alternativa más explícita:
-                    # return jsonify(error=f"Ventana de tiempo inconsistente en nodo {node}"), 400
-
 
         # Drive (solo viaje) ⇒ tope de 8h
         def drive_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node   = manager.IndexToNode(to_index)
             return int(round(extended_time_matrix[from_node][to_node]))
+
         drive_cb = routing.RegisterTransitCallback(drive_callback)
         routing.AddDimension(drive_cb, 0, HORIZON, True, "Drive")
         drive_dimension = routing.GetDimensionOrDie("Drive")
@@ -484,14 +511,17 @@ def optimize():
             drive_dimension.CumulVar(routing.End(v)).SetMax(HORIZON)
         solver = routing.solver()
         for base in range(base_num_vehicles):
-            end_cumuls = [drive_dimension.CumulVar(routing.End(v))
-                          for v in range(num_vehicles) if vehicle_mapping[v] == base]
+            end_cumuls = [
+                drive_dimension.CumulVar(routing.End(v))
+                for v in range(num_vehicles) if vehicle_mapping[v] == base
+            ]
             solver.Add(solver.Sum(end_cumuls) <= HORIZON)
 
         # Stops (conteo de visitas)
         def stop_callback(from_index, to_index):
             to_node = manager.IndexToNode(to_index)
             return 1 if to_node != depot else 0
+
         stop_cb = routing.RegisterTransitCallback(stop_callback)
         routing.AddDimension(stop_cb, 0, maximo_de_paradas, True, "Stops")
         stops_dimension = routing.GetDimensionOrDie("Stops")
@@ -511,8 +541,12 @@ def optimize():
 
         # ------------------------ Resolución del modelo ----------------------------
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-        search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-        search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        search_parameters.first_solution_strategy = (
+            routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+        )
+        search_parameters.local_search_metaheuristic = (
+            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        )
         search_parameters.time_limit.FromSeconds(tiempo_calculo)
 
         # Multihilo
@@ -605,16 +639,18 @@ def optimize():
                     drive_cumul = cumul(drive_dimension, idx)   # sólo viajes
                     stops_cumul = cumul(stops_dimension, idx)
                     wait_here = int(round(extended_wait[node]))
+                    gap_here = int(extended_gap[node]) if extended_gap[node] is not None else 0
+                    if gap_here < 0:
+                        gap_here = 0
 
-                    # Ventana / slack
+                    # Ventana / slack (respecto a cierre efectivo)
                     deadline_rel = extended_deadline[node]
-                    deadline_ub = None
+                    deadline_ub_eff = None
                     deadline_slack = None
                     if deadline_rel is not None:
-                        # Ventana impuesta sobre llegada + espera <= deadline
-                        # ⇒ llegadas permitidas hasta (deadline - wait)
-                        deadline_ub = max(0, deadline_rel - wait_here)
-                        deadline_slack = deadline_ub - time_cumul
+                        eff_deadline = int(deadline_rel) - gap_here
+                        deadline_ub_eff = max(0, eff_deadline - wait_here)
+                        deadline_slack = deadline_ub_eff - time_cumul
 
                     # Horas absolutas (si hay departure_time)
                     eta_clock = _fmt_hhmm(departure_minutes0 + time_cumul) if departure_minutes0 is not None else None
@@ -636,8 +672,16 @@ def optimize():
                         "timing": {
                             "arrival_minutes_from_departure": int(time_cumul),
                             "departure_minutes_from_departure": int(time_cumul + wait_here),
-                            "deadline_minutes_from_departure": (int(deadline_rel) if deadline_rel is not None else None),
-                            "deadline_slack_minutes": (int(deadline_slack) if deadline_slack is not None else None),
+                            # cierre real y cierre efectivo
+                            "deadline_minutes_from_departure": (
+                                int(deadline_rel) if deadline_rel is not None else None
+                            ),
+                            "latest_arrival_allowed_minutes_from_departure": (
+                                int(deadline_ub_eff) if deadline_ub_eff is not None else None
+                            ),
+                            "deadline_slack_minutes": (
+                                int(deadline_slack) if deadline_slack is not None else None
+                            ),
                             "eta_clock": eta_clock,
                             "etd_clock": etd_clock,
                             "wait_minutes": int(wait_here),
@@ -648,8 +692,8 @@ def optimize():
                                 _fmt_hhmm(departure_minutes0 + extended_opening[node])
                                 if (departure_minutes0 is not None and extended_opening[node] is not None)
                                 else None
-                            )
-
+                            ),
+                            "gap_time_minutes": int(gap_here)
                         },
                         "cumul": {
                             "time_cumul_minutes": int(time_cumul),
@@ -687,7 +731,10 @@ def optimize():
             trip_palets_sum = sum(int(d["totals"].get("palets", 0)) for d in deliveries if d.get("totals"))
 
             # Ruta por IDs (limpiando dobles 0)
-            raw_route = [0] + [extended_locations[n].get("id") if n else 0 for n in [node for node in route_nodes]] + [0]
+            raw_route = [0] + [
+                extended_locations[n].get("id") if n else 0
+                for n in [node for node in route_nodes]
+            ] + [0]
             cleaned_route = [raw_route[0]]
             for n in raw_route[1:]:
                 if not (n == 0 and cleaned_route[-1] == 0):
@@ -702,20 +749,16 @@ def optimize():
                 "total_kg": 0.0,
                 "total_units": 0.0,
                 "total_palets": 0,
-                # 👇 NUEVO: tiempos y stops agregados por camión real
                 "total_time_minutes_total": 0,
                 "total_time_minutes_drive": 0,
                 "total_stops": 0,
-                # 👇 NUEVO: capacidades de referencia del camión base
                 "capacity_kg": float(vehicle_capacities_base[main_vehicle]),
                 "capacity_palets": (
                     int(vehicle_palets_base[main_vehicle])
                     if vehicle_palets_base[main_vehicle] < PALLET_INF else None
                 ),
-                # 👇 NUEVO: registro de modos usados por ese camión
                 "modes_used": set()
             })
-
 
             agg["trips"].append({
                 "trip_no": trip_no,
@@ -754,7 +797,6 @@ def optimize():
         max_vehicle_time_drive = 0
 
         for vdata in vehicle_trips.values():
-            # Normalizar modes_used a lista ordenada + etiquetas
             modes_set = vdata.get("modes_used", set())
             mode_labels = {0: "OTHER", 1: "WALMART", 2: "CENCOSUD"}
             vdata["modes_used"] = {
@@ -762,15 +804,12 @@ def optimize():
                 "labels": [mode_labels[m] for m in sorted(modes_set) if m in mode_labels]
             }
 
-            # Acumular máximos
             max_vehicle_time_total = max(max_vehicle_time_total, vdata["total_time_minutes_total"])
             max_vehicle_time_drive = max(max_vehicle_time_drive, vdata["total_time_minutes_drive"])
 
-        # Promedios (por camión usado)
         vehicles_used = len(vehicle_trips)
         avg_vehicle_time_total = (total_time_minutes_total / vehicles_used) if vehicles_used > 0 else 0.0
         avg_vehicle_time_drive = (total_time_minutes_drive / vehicles_used) if vehicles_used > 0 else 0.0
-
 
         # ------------------------------ Respuesta --------------------------------
         return jsonify({
@@ -784,25 +823,22 @@ def optimize():
                 "reload_service_time_minutes": reload_service_time,
                 "departure_time": departure_time_str,
                 "workers": req_workers,
-                # 👇 NUEVO: métricas por camión (sobre camiones usados)
                 "vehicles_used": len(vehicle_trips),
                 "max_vehicle_time_minutes_total": int(max_vehicle_time_total),
                 "max_vehicle_time_minutes_drive": int(max_vehicle_time_drive),
                 "avg_vehicle_time_minutes_total": int(round(avg_vehicle_time_total)),
                 "avg_vehicle_time_minutes_drive": int(round(avg_vehicle_time_drive))
             },
-
-                        "totals": {
+            "totals": {
                 "total_distance": round(total_distance, 2),
                 "total_fuel_liters": round(total_fuel_liters, 2),
                 "total_kg": round(total_kg, 2),
                 "total_units": (round(total_units, 2) if total_units > 0 else None),
                 "total_palets": int(total_palets_sum),
-                # 👇 NUEVO: tiempos globales y stops
                 "total_time_minutes_total": int(total_time_minutes_total),
                 "total_time_minutes_drive": int(total_time_minutes_drive),
                 "total_stops": int(total_stops_global)
-},
+            },
             "vehicles_used": len(vehicle_trips),
             "assignments": list(vehicle_trips.values())
         })

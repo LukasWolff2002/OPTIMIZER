@@ -42,8 +42,12 @@ def optimize():
       - Dos dimensiones de tiempo:
          * Time  = viaje + espera + reload  [para ventanas/secuenciación]
          * Drive = SOLO viaje               [para tope de 8h]
-      - Ventanas: 'departure_time' (HH:MM) + 'open_time'/'arrival_time' (ISO/HH:MM) por nodo
-        ⇒ open_time - gap_time <= llegada <= (close_time - gap_time - wait) relativo a departure_time
+      - Ventanas de tiempo con:
+         * departure_time_global (HH:MM) como referencia
+         * departure_times_by_truck: dict {truck_id_str: "HH:MM"}
+           -> por camión, con fallback a global
+      - Ventanas en nodos: 'open_time'/'arrival_time' (ISO/HH:MM) + gap_time
+        ⇒ open_time - gap_time <= llegada_camion <= (close_time - gap_time - wait)
       - Límite de paradas por vehículo (Stops)
     """
     # ---------------------- Datos fijos de negocio ---------------------
@@ -92,14 +96,58 @@ def optimize():
         HORIZON = int(data.get("max_time_per_trip", 480))          # tope de conducción (Drive)
         reload_service_time = int(data.get("reload_service_time", 0))
 
-        # Ventanas: hora de salida común (t=0)
-        departure_time_str = data.get("departure_time")  # "HH:MM" o None
-        departure_minutes0 = None
-        if departure_time_str:
+        # -----------------------------------------------------------------
+        # Horas de salida:
+        #   - departure_time_global (nuevo)
+        #   - departure_times_by_truck: {truck_id_str: "HH:MM"}
+        #   - compat: si no se da departure_time_global, usar "departure_time"
+        # -----------------------------------------------------------------
+        departure_time_global_str = data.get("departure_time_global")
+        # compat antiguo nombre
+        if not departure_time_global_str:
+            departure_time_global_str = data.get("departure_time")
+
+        departure_times_by_truck_raw = (data.get("departure_times_by_truck") or {})
+        if not isinstance(departure_times_by_truck_raw, dict):
+            departure_times_by_truck_raw = {}
+
+        # Parse global
+        reference_candidates = []
+        departure_minutes_global = None
+        if departure_time_global_str:
             try:
-                departure_minutes0 = _parse_departure_minutes(departure_time_str)
+                departure_minutes_global = _parse_departure_minutes(departure_time_global_str)
+                reference_candidates.append(departure_minutes_global)
             except Exception:
-                return jsonify(error="Formato inválido en departure_time; esperado 'HH:MM'"), 400
+                return jsonify(error="Formato inválido en departure_time_global; esperado 'HH:MM'"), 400
+
+        # Map de horas por camión base (abs min desde medianoche)
+        vehicle_departure_minutes_base = [None] * base_num_vehicles
+
+        for idx in range(base_num_vehicles):
+            dep_str = None
+
+            # Si tengo truck_ids, uso ese id como clave
+            if truck_ids and idx < len(truck_ids):
+                key = str(truck_ids[idx])
+                dep_str = departure_times_by_truck_raw.get(key)
+
+            # Si no hay por camión, fallback a global
+            if not dep_str and departure_time_global_str:
+                dep_str = departure_time_global_str
+
+            if dep_str:
+                try:
+                    minutes = _parse_departure_minutes(dep_str)
+                except Exception:
+                    return jsonify(error=f"Formato inválido en departure_time para camión base {idx}"), 400
+                vehicle_departure_minutes_base[idx] = minutes
+                reference_candidates.append(minutes)
+
+        # Tiempo de referencia (t=0) = salida más temprana entre todos
+        reference_departure_minutes = None
+        if reference_candidates:
+            reference_departure_minutes = min(reference_candidates)
 
         # Validaciones tamaño
         if len(vehicle_capacities_base) != base_num_vehicles:
@@ -158,8 +206,8 @@ def optimize():
         extended_demands     = [0]        # kg
         extended_palets      = [0]        # palets
         extended_wait        = [0.0]      # min
-        extended_deadline    = [None]     # min relativo a t=0
-        extended_opening     = [None]     # min relativo a t=0 (apertura)
+        extended_deadline    = [None]     # min relativo a referencia
+        extended_opening     = [None]     # min relativo a referencia
         extended_gap         = [0]        # gap_time por nodo (min)
         extended_refrigerate = [False]    # flag
         split_mapping        = {}         # idx extendido -> idx original
@@ -175,7 +223,10 @@ def optimize():
 
         for idx_loc, loc in enumerate(locations[1:], start=1):
             # Demanda por producto (kg) y totales
-            prod_quantities = {p: int(float(loc.get("demanda", {}).get(p, 0))) for p in all_products}
+            prod_quantities = {
+                p: int(float(loc.get("demanda", {}).get(p, 0)))
+                for p in all_products
+            }
             total_demand = sum(prod_quantities.values())
 
             # Palets por ubicación
@@ -191,24 +242,24 @@ def optimize():
             if gap_time < 0:
                 gap_time = 0
 
-            # Deadline relativo si hay arrival_time + departure_time
+            # Deadline relativo (cierre) si hay arrival_time y referencia
             arrival_time_iso = loc.get("arrival_time")
             deadline_minutes_rel = None
-            if departure_minutes0 is not None and arrival_time_iso:
+            if reference_departure_minutes is not None and arrival_time_iso:
                 try:
                     arr_dt = datetime.fromisoformat(arrival_time_iso)  # soporta offset
                     arr_minutes = arr_dt.hour * 60 + arr_dt.minute
-                    delta = arr_minutes - departure_minutes0
+                    delta = arr_minutes - reference_departure_minutes
                     if delta < 0:
                         delta += 24 * 60
                     deadline_minutes_rel = int(delta)
                 except Exception:
                     deadline_minutes_rel = None
 
-            # Apertura relativa si hay open_time + departure_time
+            # Apertura relativa si hay open_time y referencia
             open_time_raw = loc.get("open_time")
             opening_minutes_rel = None
-            if departure_minutes0 is not None and open_time_raw:
+            if reference_departure_minutes is not None and open_time_raw:
                 try:
                     # Si viene como ISO, úsalo como arrival_time
                     if "T" in str(open_time_raw):
@@ -217,7 +268,7 @@ def optimize():
                     else:
                         # Si viene como "HH:MM"
                         open_minutes = _parse_departure_minutes(str(open_time_raw))
-                    delta_open = open_minutes - departure_minutes0
+                    delta_open = open_minutes - reference_departure_minutes
                     if delta_open < 0:
                         delta_open += 24 * 60
                     opening_minutes_rel = int(delta_open)
@@ -242,7 +293,10 @@ def optimize():
                 extended_refrigerate.append(requires_refrigeration)
                 split_mapping[len(extended_locations) - 1] = idx_loc
             else:
-                proportions = {p: (q / total_demand) if total_demand > 0 else 0 for p, q in prod_quantities.items()}
+                proportions = {
+                    p: (q / total_demand) if total_demand > 0 else 0
+                    for p, q in prod_quantities.items()
+                }
                 remaining = total_demand
                 remaining_per_product = prod_quantities.copy()
                 remaining_palets = palets_total
@@ -463,12 +517,33 @@ def optimize():
                 service += int(round(extended_wait[from_node]))
             return travel + service
 
-        time_cb = routing.RegisterTransitCallback(time_callback)
-        routing.AddDimension(time_cb, 0, 10**7, True, "Time")
+        # OJO: no fijamos start en cero para permitir offsets por vehículo
+        routing.AddDimension(time_callback, 0, 10**7, False, "Time")
         time_dimension = routing.GetDimensionOrDie("Time")
 
+        # Offsets de salida por vehículo duplicado (en minutos desde referencia)
+        vehicle_start_offsets = {}
+        if reference_departure_minutes is not None:
+            for v in range(num_vehicles):
+                base_idx = vehicle_mapping[v]
+                dep_abs = vehicle_departure_minutes_base[base_idx]
+                if dep_abs is None:
+                    # Si no hay hora para este camión, asumimos que puede partir en referencia
+                    offset = 0
+                else:
+                    offset = dep_abs - reference_departure_minutes
+                    if offset < 0:
+                        offset += 24 * 60
+                start_idx = routing.Start(v)
+                time_dimension.CumulVar(start_idx).SetRange(offset, offset)
+                vehicle_start_offsets[v] = offset
+        else:
+            # No hay referencia ⇒ todos offset 0
+            for v in range(num_vehicles):
+                vehicle_start_offsets[v] = 0
+
         # Ventanas: open_time - gap <= arrival <= (deadline - gap - wait)
-        if departure_minutes0 is not None:
+        if reference_departure_minutes is not None:
             for node in range(1, num_nodes):
                 idx = manager.NodeToIndex(node)
                 lb = 0          # lower bound por defecto (sin apertura)
@@ -587,6 +662,7 @@ def optimize():
             main_vehicle = vehicle_mapping[v]
             trip_no = vehicle_trip_no[v]
             mode = vehicle_mode[v]
+            start_offset = int(vehicle_start_offsets.get(v, 0))
 
             route_nodes = []
             deliveries = []
@@ -635,7 +711,7 @@ def optimize():
 
                     # Cúmulos en este nodo (ARRIVAL)
                     idx = index
-                    time_cumul = cumul(time_dimension, idx)     # incluye waits previos + viajes
+                    time_cumul = cumul(time_dimension, idx)     # desde referencia
                     drive_cumul = cumul(drive_dimension, idx)   # sólo viajes
                     stops_cumul = cumul(stops_dimension, idx)
                     wait_here = int(round(extended_wait[node]))
@@ -643,18 +719,47 @@ def optimize():
                     if gap_here < 0:
                         gap_here = 0
 
+                    # Tiempo relativo a la salida de ESTE camión
+                    arrival_from_departure = time_cumul - start_offset
+                    departure_from_departure = time_cumul + wait_here - start_offset
+
+                    if arrival_from_departure < 0:
+                        # En caso raro, clamp a 0 para salida tardía
+                        arrival_from_departure = 0
+                    if departure_from_departure < 0:
+                        departure_from_departure = 0
+
                     # Ventana / slack (respecto a cierre efectivo)
-                    deadline_rel = extended_deadline[node]
+                    deadline_rel = extended_deadline[node]          # desde referencia
                     deadline_ub_eff = None
                     deadline_slack = None
+                    latest_arrival_from_departure = None
+                    deadline_from_departure = None
+
                     if deadline_rel is not None:
                         eff_deadline = int(deadline_rel) - gap_here
-                        deadline_ub_eff = max(0, eff_deadline - wait_here)
-                        deadline_slack = deadline_ub_eff - time_cumul
+                        wait_here_dead = int(round(extended_wait[node]))
+                        deadline_ub_eff = max(0, eff_deadline - wait_here_dead)
 
-                    # Horas absolutas (si hay departure_time)
-                    eta_clock = _fmt_hhmm(departure_minutes0 + time_cumul) if departure_minutes0 is not None else None
-                    etd_clock = _fmt_hhmm(departure_minutes0 + time_cumul + wait_here) if departure_minutes0 is not None else None
+                        # Pasamos a sistema relativo a salida del camión
+                        deadline_from_departure = eff_deadline - start_offset
+                        latest_arrival_from_departure = deadline_ub_eff - start_offset
+
+                        if latest_arrival_from_departure is not None:
+                            deadline_slack = latest_arrival_from_departure - arrival_from_departure
+
+                    # Horas absolutas (si hay referencia)
+                    eta_clock, etd_clock, open_clock = None, None, None
+                    if reference_departure_minutes is not None:
+                        eta_clock = _fmt_hhmm(reference_departure_minutes + time_cumul)
+                        etd_clock = _fmt_hhmm(reference_departure_minutes + time_cumul + wait_here)
+                        if extended_opening[node] is not None:
+                            open_clock = _fmt_hhmm(reference_departure_minutes + extended_opening[node])
+
+                    # Apertura relativa a salida del camión
+                    opening_from_departure = None
+                    if extended_opening[node] is not None:
+                        opening_from_departure = int(extended_opening[node]) - start_offset
 
                     deliveries.append({
                         "location_id": loc_id,
@@ -670,32 +775,34 @@ def optimize():
                             "palets": int(extended_palets[node])
                         },
                         "timing": {
-                            "arrival_minutes_from_departure": int(time_cumul),
-                            "departure_minutes_from_departure": int(time_cumul + wait_here),
-                            # cierre real y cierre efectivo
+                            # AHORA: desde salida del camión
+                            "arrival_minutes_from_departure": int(arrival_from_departure),
+                            "departure_minutes_from_departure": int(departure_from_departure),
+
+                            # Cierre real/efectivo, ambos desde salida del camión
                             "deadline_minutes_from_departure": (
-                                int(deadline_rel) if deadline_rel is not None else None
+                                int(deadline_from_departure) if deadline_from_departure is not None else None
                             ),
                             "latest_arrival_allowed_minutes_from_departure": (
-                                int(deadline_ub_eff) if deadline_ub_eff is not None else None
+                                int(latest_arrival_from_departure)
+                                if latest_arrival_from_departure is not None else None
                             ),
                             "deadline_slack_minutes": (
                                 int(deadline_slack) if deadline_slack is not None else None
                             ),
+
                             "eta_clock": eta_clock,
                             "etd_clock": etd_clock,
                             "wait_minutes": int(wait_here),
+
                             "opening_minutes_from_departure": (
-                                int(extended_opening[node]) if extended_opening[node] is not None else None
+                                int(opening_from_departure) if opening_from_departure is not None else None
                             ),
-                            "open_clock": (
-                                _fmt_hhmm(departure_minutes0 + extended_opening[node])
-                                if (departure_minutes0 is not None and extended_opening[node] is not None)
-                                else None
-                            ),
+                            "open_clock": open_clock,
                             "gap_time_minutes": int(gap_here)
                         },
                         "cumul": {
+                            # Estos siguen siendo desde referencia global
                             "time_cumul_minutes": int(time_cumul),
                             "drive_cumul_minutes": int(drive_cumul),
                             "stops_cumul": int(stops_cumul)
@@ -709,7 +816,7 @@ def optimize():
                 dist_v += d
                 total_distance += d
 
-            # Tiempos al final del viaje (END)
+            # Tiempos al final del viaje (END) – desde referencia
             time_total = solution.Value(time_dimension.CumulVar(routing.End(v)))   # viaje + esperas + reload
             time_drive = solution.Value(drive_dimension.CumulVar(routing.End(v)))  # SOLO viaje
             stops_count = solution.Value(stops_dimension.CumulVar(routing.End(v)))
@@ -766,8 +873,8 @@ def optimize():
                 "route": cleaned_route,
                 "deliveries": deliveries,
                 "num_stops": int(stops_count),
-                "time_minutes_total": int(time_total),  # viaje + esperas + reload
-                "time_minutes_drive": int(time_drive),  # SOLO viaje
+                "time_minutes_total": int(time_total),  # desde referencia
+                "time_minutes_drive": int(time_drive),  # desde referencia
                 "distance": float(dist_v),
                 "fuel_liters": float(fuel),
                 "total_kg": round(trip_kg, 2),
@@ -812,6 +919,11 @@ def optimize():
         avg_vehicle_time_drive = (total_time_minutes_drive / vehicles_used) if vehicles_used > 0 else 0.0
 
         # ------------------------------ Respuesta --------------------------------
+        reference_departure_time_str = (
+            _fmt_hhmm(reference_departure_minutes)
+            if reference_departure_minutes is not None else None
+        )
+
         return jsonify({
             "status": "success",
             "meta": {
@@ -821,7 +933,13 @@ def optimize():
                 "max_stops_per_vehicle": maximo_de_paradas,
                 "time_multiplier": multiplicador_tiempo,
                 "reload_service_time_minutes": reload_service_time,
-                "departure_time": departure_time_str,
+
+                # Compat + nuevos campos
+                "departure_time": departure_time_global_str,          # compat viejo
+                "departure_time_global": departure_time_global_str,   # nuevo explícito
+                "departure_times_by_truck": departure_times_by_truck_raw,
+                "reference_departure_time": reference_departure_time_str,
+
                 "workers": req_workers,
                 "vehicles_used": len(vehicle_trips),
                 "max_vehicle_time_minutes_total": int(max_vehicle_time_total),

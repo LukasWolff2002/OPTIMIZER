@@ -518,8 +518,26 @@ def optimize():
             return travel + service
 
         # OJO: no fijamos start en cero para permitir offsets por vehículo
-        routing.AddDimension(time_callback, 0, 10**7, False, "Time")
+        # Time (viaje + espera + reload) ⇒ ventanas y secuenciación
+        start_indices = set(routing.Start(v) for v in range(num_vehicles))
+
+        def time_callback(from_index, to_index):
+            from_node = manager.IndexToNode(from_index)
+            to_node   = manager.IndexToNode(to_index)
+            travel = int(round(extended_time_matrix[from_node][to_node]))
+            service = 0
+            if from_node == depot and from_index not in start_indices:
+                service += reload_service_time  # reload solo afecta Time
+            if from_node != depot:
+                service += int(round(extended_wait[from_node]))
+            return travel + service
+
+        time_cb = routing.RegisterTransitCallback(time_callback)
+
+        # OJO: aquí va el índice, no la función
+        routing.AddDimension(time_cb, 0, 10**7, True, "Time")
         time_dimension = routing.GetDimensionOrDie("Time")
+
 
         # Offsets de salida por vehículo duplicado (en minutos desde referencia)
         vehicle_start_offsets = {}

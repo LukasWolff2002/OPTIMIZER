@@ -487,20 +487,37 @@ def optimize():
 
         # Offsets por hora de salida
         vehicle_start_offsets = {}
+
         if reference_departure_minutes is not None:
             for v in range(num_vehicles):
                 base_idx = vehicle_mapping[v]
+
+                # offset real de salida del camión v (dependiendo de su camión base)
                 dep_abs = vehicle_departure_minutes_base[base_idx]
-                offset = 0
-                if dep_abs is not None:
+                if dep_abs is None:
+                    offset = 0
+                else:
                     offset = dep_abs - reference_departure_minutes
                     if offset < 0:
-                        offset += 1440
-                time_dim.CumulVar(routing.Start(v)).SetRange(offset, offset)
+                        offset += 1440  # normalizar a 24h
+
+                cvar = time_dim.CumulVar(routing.Start(v))
+                lb = cvar.Min()
+                ub = cvar.Max()
+
+                # validar si el offset es factible
+                if lb <= offset <= ub:
+                    cvar.SetRange(offset, offset)
+                else:
+                    # fallback seguro: fijar al mínimo factible
+                    cvar.SetRange(lb, lb)
+
+                # guardar offset REAL (no el fallback)
                 vehicle_start_offsets[v] = offset
         else:
             for v in range(num_vehicles):
                 vehicle_start_offsets[v] = 0
+
 
         # Ventanas de tiempo nodo
         if reference_departure_minutes is not None:

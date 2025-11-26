@@ -25,7 +25,8 @@ curl -X POST http://localhost:3000/optimize \
         "lat": -33.3729829,
         "lng": -70.74902399999999,
         "identificador": "TOTTUS CD",
-        "arrival_time": null,
+        "arrival_time": "2000-01-01T09:00:00.000-03:00",
+        "open_time": "2000-01-01T06:00:00.000-03:00",
         "demanda": {
           "253": 196.0,
           "240": 196.0

@@ -129,7 +129,7 @@ def optimize():
         # -------------------- Duplicación de vehículos ----------------------------
         vehicle_capacities, vehicle_consume, vehicle_free, vehicle_palets = [], [], [], []
         vehicle_mapping, vehicle_trip_no, vehicle_mode = {}, {}, {}
-        max_trips_per_vehicle = 1  # viajes por camión (0,1)
+        max_trips_per_vehicle = 1 #2 # viajes por camión (0,1)
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
@@ -160,6 +160,7 @@ def optimize():
         extended_palets      = [0]        # palets
         extended_wait        = [0.0]      # min
         extended_deadline    = [None]     # min relativo a t=0
+        extended_opening     = [None]     # min relativo a t=0 (apertura)
         extended_refrigerate = [False]    # flag
         split_mapping        = {}         # idx extendido -> idx original
 
@@ -199,6 +200,26 @@ def optimize():
                 except Exception:
                     deadline_minutes_rel = None
 
+            # Apertura relativa si hay open_time + departure_time  👈 NUEVO
+            open_time_raw = loc.get("open_time")
+            opening_minutes_rel = None
+            if departure_minutes0 is not None and open_time_raw:
+                try:
+                    # Si viene como ISO, úsalo como arrival_time
+                    if "T" in str(open_time_raw):
+                        open_dt = datetime.fromisoformat(open_time_raw)
+                        open_minutes = open_dt.hour * 60 + open_dt.minute
+                    else:
+                        # Si viene como "HH:MM"
+                        open_minutes = _parse_departure_minutes(str(open_time_raw))
+                    delta_open = open_minutes - departure_minutes0
+                    if delta_open < 0:
+                        delta_open += 24 * 60
+                    opening_minutes_rel = int(delta_open)
+                except Exception:
+                    opening_minutes_rel = None
+
+
             # Refrigeración por identificador
             identificador = (loc.get("identificador", "") or "").upper()
             requires_refrigeration = any(name in identificador for name in [s.upper() for s in ubicaciones_refrigeradas])
@@ -210,6 +231,7 @@ def optimize():
                 extended_palets.append(palets_total)
                 extended_wait.append(wait_minutes)
                 extended_deadline.append(deadline_minutes_rel)
+                extended_opening.append(opening_minutes_rel)
                 extended_refrigerate.append(requires_refrigeration)
                 split_mapping[len(extended_locations) - 1] = idx_loc
             else:
@@ -242,6 +264,7 @@ def optimize():
                     extended_palets.append(int(palets_assigned))
                     extended_wait.append(wait_minutes)              # hereda
                     extended_deadline.append(deadline_minutes_rel)  # hereda
+                    extended_opening.append(opening_minutes_rel)       # hereda
                     extended_refrigerate.append(requires_refrigeration)
                     split_mapping[len(extended_locations) - 1] = idx_loc
 
@@ -419,12 +442,33 @@ def optimize():
         time_dimension = routing.GetDimensionOrDie("Time")
 
         # Ventanas: llegada + espera <= deadline
+        # Ventanas: open_time <= arrival <= (deadline - wait)
         if departure_minutes0 is not None:
             for node in range(1, num_nodes):
+                idx = manager.NodeToIndex(node)
+                lb = 0           # lower bound por defecto
+                ub = 10**7       # upper bound muy grande por defecto
+
+                # Límite inferior: apertura
+                if extended_opening[node] is not None:
+                    lb = max(lb, int(extended_opening[node]))
+
+                # Límite superior: deadline - wait
                 if extended_deadline[node] is not None:
-                    idx = manager.NodeToIndex(node)
-                    ub = max(0, extended_deadline[node] - int(round(extended_wait[node])))
-                    time_dimension.CumulVar(idx).SetRange(0, ub)
+                    wait_here = int(round(extended_wait[node]))
+                    ub = min(ub, max(0, int(extended_deadline[node]) - wait_here))
+
+                # Si solo hay apertura, ub queda grande; si solo hay cierre, lb=0.
+                # Si ambas, tenemos ventana [lb, ub].
+                if lb <= ub:
+                    time_dimension.CumulVar(idx).SetRange(lb, ub)
+                else:
+                    # Ventana inconsistente → lo puedes manejar como error si prefieres
+                    # Por ahora fijamos lb==ub para forzar llegada exacta (hará el problema probablemente infactible)
+                    time_dimension.CumulVar(idx).SetRange(lb, lb)
+                    # Alternativa más explícita:
+                    # return jsonify(error=f"Ventana de tiempo inconsistente en nodo {node}"), 400
+
 
         # Drive (solo viaje) ⇒ tope de 8h
         def drive_callback(from_index, to_index):
@@ -492,6 +536,10 @@ def optimize():
         vehicle_trips = {}
         total_distance, total_fuel_liters = 0.0, 0.0
         total_kg, total_units, total_palets_sum = 0.0, 0.0, 0
+
+        total_time_minutes_total = 0      # viaje + esperas + reload (suma de todos los vehículos)
+        total_time_minutes_drive = 0      # sólo conducción (Drive)
+        total_stops_global = 0
 
         # Helper para leer cumul por nodo índice de enrutador
         def cumul(dim, idx):
@@ -592,7 +640,16 @@ def optimize():
                             "deadline_slack_minutes": (int(deadline_slack) if deadline_slack is not None else None),
                             "eta_clock": eta_clock,
                             "etd_clock": etd_clock,
-                            "wait_minutes": int(wait_here)
+                            "wait_minutes": int(wait_here),
+                            "opening_minutes_from_departure": (
+                                int(extended_opening[node]) if extended_opening[node] is not None else None
+                            ),
+                            "open_clock": (
+                                _fmt_hhmm(departure_minutes0 + extended_opening[node])
+                                if (departure_minutes0 is not None and extended_opening[node] is not None)
+                                else None
+                            )
+
                         },
                         "cumul": {
                             "time_cumul_minutes": int(time_cumul),
@@ -612,6 +669,10 @@ def optimize():
             time_total = solution.Value(time_dimension.CumulVar(routing.End(v)))   # viaje + esperas + reload
             time_drive = solution.Value(drive_dimension.CumulVar(routing.End(v)))  # SOLO viaje
             stops_count = solution.Value(stops_dimension.CumulVar(routing.End(v)))
+
+            total_time_minutes_total += int(time_total)
+            total_time_minutes_drive += int(time_drive)
+            total_stops_global += int(stops_count)
 
             # Consumo
             fuel = dist_v / max(vehicle_consume[v], 1e-9)
@@ -640,8 +701,21 @@ def optimize():
                 "total_fuel_liters": 0.0,
                 "total_kg": 0.0,
                 "total_units": 0.0,
-                "total_palets": 0
+                "total_palets": 0,
+                # 👇 NUEVO: tiempos y stops agregados por camión real
+                "total_time_minutes_total": 0,
+                "total_time_minutes_drive": 0,
+                "total_stops": 0,
+                # 👇 NUEVO: capacidades de referencia del camión base
+                "capacity_kg": float(vehicle_capacities_base[main_vehicle]),
+                "capacity_palets": (
+                    int(vehicle_palets_base[main_vehicle])
+                    if vehicle_palets_base[main_vehicle] < PALLET_INF else None
+                ),
+                # 👇 NUEVO: registro de modos usados por ese camión
+                "modes_used": set()
             })
+
 
             agg["trips"].append({
                 "trip_no": trip_no,
@@ -665,10 +739,38 @@ def optimize():
             agg["total_units"] += float(trip_units_sum)
             agg["total_palets"] += int(trip_palets_sum)
 
+            agg["total_time_minutes_total"] += int(time_total)
+            agg["total_time_minutes_drive"] += int(time_drive)
+            agg["total_stops"] += int(stops_count)
+            agg["modes_used"].add(int(mode))
+
             # Totales globales
             total_kg += float(trip_kg)
             total_units += float(trip_units_sum)
             total_palets_sum += int(trip_palets_sum)
+
+        # ----------------- Post-procesamiento por vehículo base -----------------
+        max_vehicle_time_total = 0
+        max_vehicle_time_drive = 0
+
+        for vdata in vehicle_trips.values():
+            # Normalizar modes_used a lista ordenada + etiquetas
+            modes_set = vdata.get("modes_used", set())
+            mode_labels = {0: "OTHER", 1: "WALMART", 2: "CENCOSUD"}
+            vdata["modes_used"] = {
+                "ids": sorted(modes_set),
+                "labels": [mode_labels[m] for m in sorted(modes_set) if m in mode_labels]
+            }
+
+            # Acumular máximos
+            max_vehicle_time_total = max(max_vehicle_time_total, vdata["total_time_minutes_total"])
+            max_vehicle_time_drive = max(max_vehicle_time_drive, vdata["total_time_minutes_drive"])
+
+        # Promedios (por camión usado)
+        vehicles_used = len(vehicle_trips)
+        avg_vehicle_time_total = (total_time_minutes_total / vehicles_used) if vehicles_used > 0 else 0.0
+        avg_vehicle_time_drive = (total_time_minutes_drive / vehicles_used) if vehicles_used > 0 else 0.0
+
 
         # ------------------------------ Respuesta --------------------------------
         return jsonify({
@@ -681,15 +783,26 @@ def optimize():
                 "time_multiplier": multiplicador_tiempo,
                 "reload_service_time_minutes": reload_service_time,
                 "departure_time": departure_time_str,
-                "workers": req_workers
+                "workers": req_workers,
+                # 👇 NUEVO: métricas por camión (sobre camiones usados)
+                "vehicles_used": len(vehicle_trips),
+                "max_vehicle_time_minutes_total": int(max_vehicle_time_total),
+                "max_vehicle_time_minutes_drive": int(max_vehicle_time_drive),
+                "avg_vehicle_time_minutes_total": int(round(avg_vehicle_time_total)),
+                "avg_vehicle_time_minutes_drive": int(round(avg_vehicle_time_drive))
             },
-            "totals": {
+
+                        "totals": {
                 "total_distance": round(total_distance, 2),
                 "total_fuel_liters": round(total_fuel_liters, 2),
                 "total_kg": round(total_kg, 2),
                 "total_units": (round(total_units, 2) if total_units > 0 else None),
-                "total_palets": int(total_palets_sum)
-            },
+                "total_palets": int(total_palets_sum),
+                # 👇 NUEVO: tiempos globales y stops
+                "total_time_minutes_total": int(total_time_minutes_total),
+                "total_time_minutes_drive": int(total_time_minutes_drive),
+                "total_stops": int(total_stops_global)
+},
             "vehicles_used": len(vehicle_trips),
             "assignments": list(vehicle_trips.values())
         })

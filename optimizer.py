@@ -552,7 +552,7 @@ def optimize():
         # Multihilo
         req_workers = data.get("search_workers")
         if req_workers is None:
-            req_workers = os.environ.get("ORTOOLS_WORKERS")
+            req_workers = 4
         try:
             req_workers = int(req_workers) if req_workers is not None else 0
         except Exception:

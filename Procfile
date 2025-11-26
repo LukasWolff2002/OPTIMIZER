@@ -1,1 +1,1 @@
-web: gunicorn -c gunicorn.conf.py -w 32 -b 0.0.0.0:5000 optimizer:app
+web: gunicorn -c gunicorn.conf.py -w 4 -b 0.0.0.0:$PORT optimizer:app

@@ -1,1 +1,1 @@
-web: gunicorn -c gunicorn.conf.py -w 4 -b 0.0.0.0:$PORT optimizer:app
+web: gunicorn optimizer:app --workers 4 --bind 0.0.0.0:$PORT

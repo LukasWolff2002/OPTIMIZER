@@ -8,26 +8,22 @@ curl -X POST http://localhost:3000/optimize \
         "lat": -32.8721275,
         "lng": -71.2080314,
         "identificador": "PACKING",
-        "arrival_time": null,
-        "demanda": {
-        },
-        "precios": {
-        },
-        "pesos": {
-        },
-        "unidades": {
-        },
+        "demanda": {},
+        "precios": {},
+        "pesos": {},
+        "unidades": {},
         "wait_minutes": 30.0,
-        "palets_en_suelo": 0
+        "palets_en_suelo": 0,
+        "open_time": null,
+        "close_time": null,
+        "opening_gap": 0,
+        "closing_gap": 0
       },
       {
         "id": 70,
         "lat": -33.3729829,
         "lng": -70.74902399999999,
         "identificador": "TOTTUS CD",
-        "arrival_time": "2000-01-01T09:00:00.000-03:00",
-        "open_time": "2000-01-01T06:00:00.000-03:00",
-        "gap_time": 30,
         "demanda": {
           "253": 196.0,
           "240": 196.0
@@ -44,18 +40,21 @@ curl -X POST http://localhost:3000/optimize \
           "253": 10,
           "240": 10
         },
-        "wait_minutes": 137.02810581629032,
-        "palets_en_suelo": 2
+        "wait_minutes": 137.0,
+        "palets_en_suelo": 2.5,
+        "open_time": "06:00",
+        "close_time": "09:00",
+        "opening_gap": 20,
+        "closing_gap": 30
       },
       {
         "id": 89,
         "lat": -33.5979953,
         "lng": -70.513579,
         "identificador": "SANTA ISABEL LOCAL",
-        "arrival_time": null,
         "demanda": {
           "250": 15.66,
-          "228": 65.19999999999999
+          "228": 65.2
         },
         "precios": {
           "250": 16388.0,
@@ -69,18 +68,21 @@ curl -X POST http://localhost:3000/optimize \
           "250": 15,
           "228": 1
         },
-        "wait_minutes": 40.24853263636477,
-        "palets_en_suelo": 1
+        "wait_minutes": 40.0,
+        "palets_en_suelo": 1.0,
+        "open_time": "07:00",
+        "close_time": "12:00",
+        "opening_gap": 15,
+        "closing_gap": 15
       },
       {
         "id": 106,
         "lat": -33.510324,
         "lng": -70.6069152,
         "identificador": "JUMBO LOCAL",
-        "arrival_time": null,
         "demanda": {
           "114": 213.0,
-          "251": 52.199999999999996,
+          "251": 52.2,
           "108": 163.0
         },
         "precios": {
@@ -98,19 +100,22 @@ curl -X POST http://localhost:3000/optimize \
           "251": 15,
           "108": 1
         },
-        "wait_minutes": 41.16841084232277,
-        "palets_en_suelo": 1
+        "wait_minutes": 41.0,
+        "palets_en_suelo": 1.5,
+        "open_time": "07:30",
+        "close_time": "13:00",
+        "opening_gap": 15,
+        "closing_gap": 20
       },
       {
         "id": 109,
         "lat": -33.48045159999999,
         "lng": -70.75015979999999,
         "identificador": "JUMBO LOCAL",
-        "arrival_time": null,
         "demanda": {
           "114": 25.56,
           "251": 31.32,
-          "108": 130.39999999999998
+          "108": 130.4
         },
         "precios": {
           "114": 10906.0,
@@ -127,107 +132,39 @@ curl -X POST http://localhost:3000/optimize \
           "251": 15,
           "108": 1
         },
-        "wait_minutes": 63.25251602401736,
-        "palets_en_suelo": 1
+        "wait_minutes": 63.0,
+        "palets_en_suelo": 0.5,
+        "open_time": "08:00",
+        "close_time": "14:00",
+        "opening_gap": 10,
+        "closing_gap": 10
       }
     ],
     "distance_matrix": [
-      [
-        0,
-        119,
-        156,
-        137,
-        133
-      ],
-      [
-        121,
-        0,
-        44,
-        27,
-        15
-      ],
-      [
-        156,
-        46,
-        0,
-        15,
-        30
-      ],
-      [
-        138,
-        37,
-        14,
-        0,
-        22
-      ],
-      [
-        136,
-        17,
-        30,
-        21,
-        0
-      ]
+      [0,   119, 156, 137, 133],
+      [121, 0,   44,  27,  15],
+      [156, 46,  0,   15,  30],
+      [138, 37,  14,  0,   22],
+      [136, 17,  30,  21,  0 ]
     ],
     "time_matrix": [
-      [
-        0,
-        99.88,
-        145.44,
-        122.69999999999999,
-        111.58
-      ],
-      [
-        102.56,
-        0,
-        57.54,
-        38.3,
-        18.56
-      ],
-      [
-        146.45999999999998,
-        58.22,
-        0,
-        36.58,
-        45.199999999999996
-      ],
-      [
-        124.8,
-        39.8,
-        34.64,
-        0,
-        26.76
-      ],
-      [
-        114.76,
-        20.34,
-        45.76,
-        27.56,
-        0
-      ]
+      [0,      99.88,  145.44, 122.70, 111.58],
+      [102.56, 0,      57.54,  38.30,  18.56 ],
+      [146.46, 58.22,  0,      36.58,  45.20 ],
+      [124.80, 39.80,  34.64,  0,      26.76 ],
+      [114.76, 20.34,  45.76,  27.56,  0     ]
     ],
-    "max_vehicles": 1,
-    "vehicle_capacities": [
-      4500
-    ],
-    "vehicle_palets": [
-      7
-    ],
-    "vehicle_interno": [
-      1
-    ],
-    "vehicle_consume": [
-      5.4
-    ],
-    "vehicle_free": [
-      1
-    ],
+    "max_vehicles": 2,
+    "vehicle_capacities": [700, 700],
+    "vehicle_palets": [3, 3],
+    "vehicle_interno": [1, 0],
+    "vehicle_consume": [5.4, 6.0],
+    "vehicle_free": [1, 1],
+    "vehicle_departure_times": ["04:00", "05:30"],
     "tiempo_calculo": 1,
     "maximas_paradas_camion": 5,
-    "multiplicador_tiempo": 1.2,
-    "departure_time": "04:00"
+    "multiplicador_tiempo": 1.2
   },
-  [
-    7
-  ],
+  [7, 12],
   331
 ]'

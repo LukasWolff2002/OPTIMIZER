@@ -239,12 +239,24 @@ def optimize():
 
             # Gaps independientes de apertura y cierre (minutos)
             # Ventana efectiva: (open_time - opening_gap) ... (close_time - closing_gap)
-            opening_gap = int(loc.get("opening_gap", 0) or 0)
-            closing_gap = int(loc.get("closing_gap", 0) or 0)
-            if opening_gap < 0:
+            # Si son None o negativos, se normalizan a 0
+            opening_gap = loc.get("opening_gap")
+            closing_gap = loc.get("closing_gap")
+            
+            # Normalizar a entero, tratando None como 0
+            if opening_gap is None or opening_gap == "":
                 opening_gap = 0
-            if closing_gap < 0:
+            else:
+                opening_gap = int(opening_gap)
+                if opening_gap < 0:
+                    opening_gap = 0
+            
+            if closing_gap is None or closing_gap == "":
                 closing_gap = 0
+            else:
+                closing_gap = int(closing_gap)
+                if closing_gap < 0:
+                    closing_gap = 0
 
             # Deadline relativo (cierre) usando close_time + closing_gap
             # Si close_time es None o vacío, no hay restricción de cierre

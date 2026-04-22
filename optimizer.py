@@ -271,8 +271,8 @@ def optimize():
                         close_minutes = _parse_departure_minutes(str(close_time_raw))
                     # El optimizador recibe el cierre nominal; el gap se aplica internamente
                     delta = close_minutes - reference_departure_minutes
-                    if delta < 0:
-                        delta += 24 * 60
+                    #if delta < 0:
+                    #    delta += 24 * 60
                     deadline_minutes_rel = int(delta)
                 except Exception:
                     # Si hay error parseando, no aplicar restricción
@@ -290,8 +290,8 @@ def optimize():
                     else:
                         open_minutes = _parse_departure_minutes(str(open_time_raw))
                     delta_open = open_minutes - reference_departure_minutes
-                    if delta_open < 0:
-                        delta_open += 24 * 60
+                    #if delta_open < 0:
+                    #    delta_open += 24 * 60
                     opening_minutes_rel = int(delta_open)
                 except Exception:
                     # Si hay error parseando, no aplicar restricción

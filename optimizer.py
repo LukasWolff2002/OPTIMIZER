@@ -48,6 +48,7 @@ def optimize():
          * Fallback: departure_time_global / departure_time (compat)
       - Ventanas en nodos: 'open_time'/'close_time' (HH:MM) + opening_gap/closing_gap
         ⇒ (open_time - opening_gap) <= llegada_camion <= (close_time - closing_gap - wait)
+        ⇒ Si open_time o close_time son None/vacío → sin restricción (entrega 24/7)
       - Límite de paradas por vehículo (Stops)
     """
     # ---------------------- Datos fijos de negocio ---------------------
@@ -246,6 +247,7 @@ def optimize():
                 closing_gap = 0
 
             # Deadline relativo (cierre) usando close_time + closing_gap
+            # Si close_time es None o vacío, no hay restricción de cierre
             close_time_raw = loc.get("close_time")
             deadline_minutes_rel = None
             if reference_departure_minutes is not None and close_time_raw:
@@ -261,9 +263,11 @@ def optimize():
                         delta += 24 * 60
                     deadline_minutes_rel = int(delta)
                 except Exception:
+                    # Si hay error parseando, no aplicar restricción
                     deadline_minutes_rel = None
 
             # Apertura relativa usando open_time + opening_gap
+            # Si open_time es None o vacío, no hay restricción de apertura
             open_time_raw = loc.get("open_time")
             opening_minutes_rel = None
             if reference_departure_minutes is not None and open_time_raw:
@@ -278,6 +282,7 @@ def optimize():
                         delta_open += 24 * 60
                     opening_minutes_rel = int(delta_open)
                 except Exception:
+                    # Si hay error parseando, no aplicar restricción
                     opening_minutes_rel = None
 
             # Refrigeración por identificador
@@ -560,8 +565,10 @@ def optimize():
                 time_dimension.CumulVar(start_idx).SetRange(0, 0)
                 vehicle_start_offsets[v] = 0
 
-        # Ventanas: arrival >= (open_time - opening_gap)
-        #           arrival <= (close_time - closing_gap - wait)
+        # Ventanas horarias:
+        #   - Si open_time existe: arrival >= (open_time - opening_gap)
+        #   - Si close_time existe: arrival <= (close_time - closing_gap - wait)
+        #   - Si alguno es None: no se aplica esa restricción (entrega en cualquier horario)
         if reference_departure_minutes is not None:
             for node in range(1, num_nodes):
                 idx = manager.NodeToIndex(node)
@@ -573,23 +580,28 @@ def optimize():
                 if op_gap < 0: op_gap = 0
                 if cl_gap < 0: cl_gap = 0
 
-                # Límite inferior: el camión puede llegar desde (open_time - opening_gap)
+                # Límite inferior: solo si existe open_time
+                # Si extended_opening[node] es None → sin restricción de apertura
                 if extended_opening[node] is not None:
                     eff_open = int(extended_opening[node]) - op_gap
                     lb = max(lb, max(0, eff_open))
 
-                # Límite superior: el camión debe llegar antes de (close_time - closing_gap - wait)
+                # Límite superior: solo si existe close_time
+                # Si extended_deadline[node] es None → sin restricción de cierre
                 if extended_deadline[node] is not None:
                     wait_here = int(round(extended_wait[node]))
                     eff_deadline = int(extended_deadline[node]) - cl_gap
                     ub_deadline = eff_deadline - wait_here
                     ub = min(ub, max(0, ub_deadline))
 
-                if lb <= ub:
-                    time_dimension.CumulVar(idx).SetRange(lb, ub)
-                else:
-                    # Ventana inconsistente → forzar infactible
-                    time_dimension.CumulVar(idx).SetRange(lb, lb)
+                # Solo aplicar restricción si hay al menos una ventana definida
+                # Si ambos son None, el nodo no tiene restricciones horarias (24/7)
+                if extended_opening[node] is not None or extended_deadline[node] is not None:
+                    if lb <= ub:
+                        time_dimension.CumulVar(idx).SetRange(lb, ub)
+                    else:
+                        # Ventana inconsistente → forzar infactible
+                        time_dimension.CumulVar(idx).SetRange(lb, lb)
 
         # Drive (solo viaje) ⇒ tope de 8h
         def drive_callback(from_index, to_index):
@@ -783,10 +795,15 @@ def optimize():
                     #   = hora_salida_camion + minutos_desde_salida_hasta_llegada
                     # ETD: hora real de salida del local (tras espera)
                     #   = ETA + wait
+                    # 
+                    # NOTA: Si extended_opening[node] o extended_deadline[node] son None,
+                    # significa que la ubicación NO tiene horarios configurados (24/7).
+                    # En ese caso, open_clock/close_clock permanecen None y no se aplican
+                    # restricciones horarias en la optimización.
                     eta_clock  = None
                     etd_clock  = None
-                    open_clock = None
-                    close_clock = None
+                    open_clock = None      # None = sin restricción de apertura (24/7)
+                    close_clock = None     # None = sin restricción de cierre (24/7)
                     open_eff_clock  = None   # apertura efectiva = open - opening_gap
                     close_eff_clock = None   # cierre efectivo   = close - closing_gap
 

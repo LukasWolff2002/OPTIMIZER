@@ -11,12 +11,21 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------
 # Conexión a Redis y Función de Estado
 # ---------------------------------------------------------------------
-# Ajusta el host y port si tu Redis no corre en localhost
-redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+
+# Buscamos la URL de Redis en las variables de entorno. 
+# Si no la encuentra (ej. entorno de desarrollo local), usa localhost por defecto.
+redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+try:
+    redis_client = redis.from_url(redis_url)
+except Exception as e:
+    print(f"Error conectando a Redis: {e}")
+    redis_client = None
 
 def update_job_status(job_id: str, status: str, message: str, progress: int):
     """Guarda el progreso en Redis. Falla silenciosamente para no quebrar el optimizador."""
-    if not job_id:
+    if not job_id or not redis_client:
         return
     try:
         estado = {
@@ -25,10 +34,9 @@ def update_job_status(job_id: str, status: str, message: str, progress: int):
             "progress": progress,
             "updated_at": datetime.utcnow().isoformat()
         }
-        # Expira en 1 hora (3600 seg) para no llenar la memoria de Redis
         redis_client.setex(f"opt_status_{job_id}", 3600, json.dumps(estado))
     except Exception as e:
-        print(f"Error actualizando Redis: {e}")
+        print(f"Error escribiendo en Redis: {e}")
 
 # ---------------------------------------------------------------------
 # Utilidades

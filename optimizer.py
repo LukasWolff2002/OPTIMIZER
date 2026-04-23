@@ -11,17 +11,27 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------
 # Conexión a Redis y Función de Estado
 # ---------------------------------------------------------------------
-
-
 # Buscamos la URL de Redis en las variables de entorno. 
-# Si no la encuentra (ej. entorno de desarrollo local), usa localhost por defecto.
-redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+redis_url = os.environ.get("REDIS_URL")
 
-try:
-    redis_client = redis.from_url(redis_url)
-except Exception as e:
-    print(f"Error conectando a Redis: {e}")
-    redis_client = None
+redis_client = None
+if redis_url:
+    try:
+        # Railway usa URLs seguras (rediss://) que requieren desactivar la verificación estricta de SSL
+        if redis_url.startswith("rediss://"):
+            import ssl
+            redis_client = redis.from_url(redis_url, ssl_cert_reqs=ssl.CERT_NONE)
+        else:
+            redis_client = redis.from_url(redis_url)
+        
+        # Hacemos un ping para asegurar que de verdad conectó
+        redis_client.ping()
+        print("✅ Conectado a Redis exitosamente.")
+    except Exception as e:
+        print(f"❌ Error conectando a Redis: {e}")
+        redis_client = None
+else:
+    print("⚠️ ADVERTENCIA: Variable REDIS_URL no configurada.")
 
 def update_job_status(job_id: str, status: str, message: str, progress: int):
     """Guarda el progreso en Redis. Falla silenciosamente para no quebrar el optimizador."""

@@ -461,16 +461,14 @@ def optimize():
                                 # entonces LA VEGA debe venir del depot
                                 is_lv_in_route = routing.ActiveVar(node_idx)
                                 is_other_in_route = routing.ActiveVar(other_idx)
-                                lv_comes_from_start = routing.NextVar(start_idx) == node_idx
                                 
                                 # Implicación: (LA VEGA activa AND otro_nodo activo) => LA VEGA viene del depot
-                                solver.Add(
-                                    solver.ConditionalExpression(
-                                        solver.And(is_lv_in_route == 1, is_other_in_route == 1),
-                                        lv_comes_from_start == 1,
-                                        1 == 1  # siempre verdadero si la condición no se cumple
-                                    )
-                                )
+                                # Usando producto para simular AND: ambos == 1 => producto == 1
+                                both_active = solver.IsEqualCstVar(is_lv_in_route * is_other_in_route, 1)
+                                lv_is_first = solver.IsEqualCstVar(routing.NextVar(start_idx), node_idx)
+                                
+                                # Si ambos están activos, LA VEGA debe ser la primera
+                                solver.Add(both_active <= lv_is_first)
 
         # Continuación del código original...
         any_pa_exists = any(is_pa_node[1:])

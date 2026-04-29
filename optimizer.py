@@ -87,6 +87,7 @@ def optimize():
       - Hora de salida independiente por camión
       - Ventanas en nodos (Corregidas)
       - Límite de paradas por vehículo (Stops)
+      - NUEVA REGLA: LA VEGA puede ir en rutas CENCOSUD solo si es la primera parada
     """
     job_id = None
     
@@ -407,21 +408,7 @@ def optimize():
                     if not vehicle_free[vehicle_id]:
                         routing.VehicleVar(node_idx).RemoveValue(vehicle_id)
 
-        MODE_FREE, MODE_W, MODE_C = 0, 1, 2
-        for node_index in range(1, num_nodes):
-            g = node_group[node_index]
-            node_idx = manager.NodeToIndex(node_index)
-            if g == "WALMART":
-                allowed = {MODE_W}
-            elif g == "CENCOSUD":
-                allowed = {MODE_C}
-            else:
-                allowed = {MODE_FREE}
-            for v in range(num_vehicles):
-                if vehicle_mode[v] not in allowed:
-                    routing.VehicleVar(node_idx).RemoveValue(v)
-
-        HIGH_PENALTY = 100_000
+        # Identificación de nodos especiales ANTES de asignar modos
         prioridad_pa_tag = "PUNTO AZUL"
         prioridad_lv_tag = "LA VEGA"
         prioridad_tottus_tag = "TOTTUS CD"
@@ -434,6 +421,58 @@ def optimize():
             is_lv_node.append(prioridad_lv_tag in ident)
             is_tottus_node.append(prioridad_tottus_tag in ident)
             is_unimarc_node.append(prioridad_unimarc_tag in ident)
+
+        # MODIFICACIÓN: Permitir LA VEGA en rutas CENCOSUD
+        MODE_FREE, MODE_W, MODE_C = 0, 1, 2
+        for node_index in range(1, num_nodes):
+            g = node_group[node_index]
+            node_idx = manager.NodeToIndex(node_index)
+            if g == "WALMART":
+                allowed = {MODE_W}
+            elif g == "CENCOSUD":
+                allowed = {MODE_C}
+            else:
+                # LA VEGA puede ir en rutas MODE_C (CENCOSUD) además de MODE_FREE
+                if is_lv_node[node_index]:
+                    allowed = {MODE_FREE, MODE_C}
+                else:
+                    allowed = {MODE_FREE}
+            for v in range(num_vehicles):
+                if vehicle_mode[v] not in allowed:
+                    routing.VehicleVar(node_idx).RemoveValue(v)
+        
+        # NUEVA RESTRICCIÓN: Si una ruta CENCOSUD incluye LA VEGA, debe ser la primera parada
+        solver = routing.solver()
+        for v in range(num_vehicles):
+            if vehicle_mode[v] == MODE_C:  # Solo para vehículos en modo CENCOSUD
+                start_idx = routing.Start(v)
+                
+                for node_index in range(1, num_nodes):
+                    if is_lv_node[node_index]:
+                        node_idx = manager.NodeToIndex(node_index)
+                        
+                        # Si LA VEGA está en esta ruta, debe ser inmediatamente después del start
+                        # Creamos una constraint: si este nodo está en la ruta, debe ser el primero
+                        for other_node in range(1, num_nodes):
+                            if other_node != node_index and node_group[other_node] == "CENCOSUD":
+                                other_idx = manager.NodeToIndex(other_node)
+                                
+                                # Si LA VEGA está en la ruta Y otro nodo CENCOSUD también está:
+                                # entonces LA VEGA debe venir del depot
+                                is_lv_in_route = routing.ActiveVar(node_idx)
+                                is_other_in_route = routing.ActiveVar(other_idx)
+                                lv_comes_from_start = routing.NextVar(start_idx) == node_idx
+                                
+                                # Implicación: (LA VEGA activa AND otro_nodo activo) => LA VEGA viene del depot
+                                solver.Add(
+                                    solver.ConditionalExpression(
+                                        solver.And(is_lv_in_route == 1, is_other_in_route == 1),
+                                        lv_comes_from_start == 1,
+                                        1 == 1  # siempre verdadero si la condición no se cumple
+                                    )
+                                )
+
+        # Continuación del código original...
         any_pa_exists = any(is_pa_node[1:])
         any_lv_exists = any(is_lv_node[1:])
         any_tier3_exists = any(
@@ -443,6 +482,7 @@ def optimize():
         def is_tier3(i):
             return is_tottus_node[i] or is_unimarc_node[i]
 
+        HIGH_PENALTY = 100_000
         START_PENALTY_OTHER_WITH_PA = 90_000
         START_PENALTY_TIER3_WITH_PA = 60_000
         START_PENALTY_LV_WITH_PA    = 35_000
@@ -504,10 +544,19 @@ def optimize():
                             if is_tier3(from_node) and is_lv_node[to_node]:
                                 base += LV_AFTER_TIER3_EXTRA_PENALTY
 
+                    # MODIFICACIÓN: No penalizar mezcla LA VEGA + CENCOSUD
                     if from_node != depot and to_node != depot:
                         g_from, g_to = node_group[from_node], node_group[to_node]
-                        if g_from != g_to and ("WALMART" in (g_from, g_to) or "CENCOSUD" in (g_from, g_to)):
-                            base += HIGH_PENALTY
+                        
+                        # EXCEPCIÓN: LA VEGA puede mezclarse con CENCOSUD
+                        is_lv_exception = (
+                            (is_lv_node[from_node] and g_to == "CENCOSUD") or
+                            (g_from == "CENCOSUD" and is_lv_node[to_node])
+                        )
+                        
+                        if not is_lv_exception:
+                            if g_from != g_to and ("WALMART" in (g_from, g_to) or "CENCOSUD" in (g_from, g_to)):
+                                base += HIGH_PENALTY
                     return base
                 return distance
             callback_idx = routing.RegisterTransitCallback(make_vehicle_callback(v))
@@ -609,7 +658,7 @@ def optimize():
 
         for v in range(num_vehicles):
             drive_dimension.CumulVar(routing.End(v)).SetMax(HORIZON)
-        solver = routing.solver()
+        
         for base in range(base_num_vehicles):
             end_cumuls = [
                 drive_dimension.CumulVar(routing.End(v))

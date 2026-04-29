@@ -442,33 +442,46 @@ def optimize():
                     routing.VehicleVar(node_idx).RemoveValue(v)
         
         # NUEVA RESTRICCIÓN: Si una ruta CENCOSUD incluye LA VEGA, debe ser la primera parada
+        # Se implementa como PENALIZACIÓN SUAVE por defecto (más robusto)
+        # Para activar restricción dura: enforce_lv_first_hard=true en el request
         solver = routing.solver()
-        for v in range(num_vehicles):
-            if vehicle_mode[v] == MODE_C:  # Solo para vehículos en modo CENCOSUD
-                start_idx = routing.Start(v)
-                
-                for node_index in range(1, num_nodes):
-                    if is_lv_node[node_index]:
-                        node_idx = manager.NodeToIndex(node_index)
+        
+        # Flag para activar/desactivar la restricción dura (desactivado por defecto)
+        enforce_lv_first_hard = data.get("enforce_lv_first_hard", False)
+        
+        if enforce_lv_first_hard:
+            # ADVERTENCIA: Esta restricción dura puede causar infactibilidad
+            # Solo usarla cuando estés seguro de que la ruta es factible
+            for v in range(num_vehicles):
+                if vehicle_mode[v] == MODE_C:  # Solo para vehículos en modo CENCOSUD
+                    start_idx = routing.Start(v)
+                    
+                    # Encontrar índices de LA VEGA y nodos CENCOSUD
+                    lv_indices = [manager.NodeToIndex(i) for i in range(1, num_nodes) if is_lv_node[i]]
+                    cencosud_indices = [manager.NodeToIndex(i) for i in range(1, num_nodes) 
+                                       if node_group[i] == "CENCOSUD"]
+                    
+                    # Para cada nodo LA VEGA
+                    for lv_idx in lv_indices:
+                        lv_node = manager.IndexToNode(lv_idx)
                         
-                        # Si LA VEGA está en esta ruta, debe ser inmediatamente después del start
-                        # Creamos una constraint: si este nodo está en la ruta, debe ser el primero
-                        for other_node in range(1, num_nodes):
-                            if other_node != node_index and node_group[other_node] == "CENCOSUD":
-                                other_idx = manager.NodeToIndex(other_node)
-                                
-                                # Si LA VEGA está en la ruta Y otro nodo CENCOSUD también está:
-                                # entonces LA VEGA debe venir del depot
-                                is_lv_in_route = routing.ActiveVar(node_idx)
-                                is_other_in_route = routing.ActiveVar(other_idx)
-                                
-                                # Implicación: (LA VEGA activa AND otro_nodo activo) => LA VEGA viene del depot
-                                # Usando producto para simular AND: ambos == 1 => producto == 1
-                                both_active = solver.IsEqualCstVar(is_lv_in_route * is_other_in_route, 1)
-                                lv_is_first = solver.IsEqualCstVar(routing.NextVar(start_idx), node_idx)
-                                
-                                # Si ambos están activos, LA VEGA debe ser la primera
-                                solver.Add(both_active <= lv_is_first)
+                        # Para cada nodo CENCOSUD (que no sea LA VEGA)
+                        for cenc_idx in cencosud_indices:
+                            cenc_node = manager.IndexToNode(cenc_idx)
+                            if cenc_node == lv_node:
+                                continue
+                            
+                            # Si ambos están en la misma ruta de este vehículo MODE_C,
+                            # entonces LA VEGA debe venir directamente del start
+                            lv_active = routing.ActiveVar(lv_idx)
+                            cenc_active = routing.ActiveVar(cenc_idx)
+                            
+                            # Si ambos activos => LA VEGA es next(start)
+                            # Usamos: lv_active + cenc_active <= 1 + lv_is_first
+                            # Equivale a: (lv_active AND cenc_active) => lv_is_first
+                            lv_next_var = routing.NextVar(start_idx)
+                            solver.Add((lv_active + cenc_active - 1) <= 
+                                     solver.IsEqualCstVar(lv_next_var, lv_idx))
 
         # Continuación del código original...
         any_pa_exists = any(is_pa_node[1:])
@@ -555,6 +568,14 @@ def optimize():
                         if not is_lv_exception:
                             if g_from != g_to and ("WALMART" in (g_from, g_to) or "CENCOSUD" in (g_from, g_to)):
                                 base += HIGH_PENALTY
+                    
+                    # PENALIZACIÓN SUAVE: Si en modo CENCOSUD, penalizar ir a LA VEGA después de otro nodo CENCOSUD
+                    if vehicle_mode[v_idx] == MODE_C:
+                        if to_node != depot and is_lv_node[to_node]:
+                            if from_node != depot and node_group[from_node] == "CENCOSUD":
+                                # LA VEGA viene después de un nodo CENCOSUD (no es primera)
+                                base += 50_000  # Penalización moderada
+                    
                     return base
                 return distance
             callback_idx = routing.RegisterTransitCallback(make_vehicle_callback(v))

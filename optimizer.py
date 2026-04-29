@@ -8,7 +8,8 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------
+# --------------------
+# -------------------------------------------------
 # Conexión a Redis y Función de Estado
 # ---------------------------------------------------------------------
 # Buscamos la URL de Redis en las variables de entorno. 

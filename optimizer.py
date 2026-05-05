@@ -8,8 +8,7 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# --------------------
-# -------------------------------------------------
+# ---------------------------------------------------------------------
 # Conexión a Redis y Función de Estado
 # ---------------------------------------------------------------------
 # Buscamos la URL de Redis en las variables de entorno. 
@@ -262,6 +261,10 @@ def optimize():
 
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
+            # Limitar tiempo de espera a máximo 3 horas (180 minutos)
+            MAX_WAIT_MINUTES = 180
+            if wait_minutes > MAX_WAIT_MINUTES:
+                wait_minutes = MAX_WAIT_MINUTES
 
             opening_gap = loc.get("opening_gap")
             closing_gap = loc.get("closing_gap")
@@ -651,20 +654,35 @@ def optimize():
                 if op_gap < 0: op_gap = 0
                 if cl_gap < 0: cl_gap = 0
 
+                # CAMBIO IMPORTANTE: Las ventanas se aplican a la LLEGADA, no a la salida
+                # Por eso NO restamos wait_time del deadline
+                
                 if extended_opening[node] is not None:
+                    # Hora más temprana de LLEGADA permitida
                     eff_open = int(extended_opening[node]) - op_gap
                     lb = max(lb, max(0, eff_open))
 
                 if extended_deadline[node] is not None:
-                    wait_here = int(round(extended_wait[node]))
+                    # Hora más tardía de LLEGADA permitida (NO restamos wait_time)
                     eff_deadline = int(extended_deadline[node]) - cl_gap
-                    ub_deadline = eff_deadline - wait_here
-                    ub = min(ub, max(0, ub_deadline))
+                    ub = min(ub, max(0, eff_deadline))
+
+                # VALIDACIÓN: Verificar si la ventana es factible
+                if extended_opening[node] is not None and extended_deadline[node] is not None:
+                    if ub < lb:
+                        loc_id = extended_locations[node].get('id', node)
+                        loc_name = extended_locations[node].get('identificador', 'unknown')
+                        wait_here = int(round(extended_wait[node]))
+                        print(f"⚠️ ADVERTENCIA: Ubicación {loc_id} ({loc_name}) tiene ventana imposible:")
+                        print(f"   - Debe llegar después de: {lb} min desde salida (open={extended_opening[node]}, gap={op_gap})")
+                        print(f"   - Debe llegar antes de: {ub} min desde salida (close={extended_deadline[node]}, gap={cl_gap})")
+                        print(f"   - Tiempo de espera: {wait_here} min (NO afecta la ventana de llegada)")
 
                 if extended_opening[node] is not None or extended_deadline[node] is not None:
                     if lb <= ub:
                         time_dimension.CumulVar(idx).SetRange(lb, ub)
                     else:
+                        # Si la ventana es imposible, usar solo el límite inferior
                         time_dimension.CumulVar(idx).SetRange(lb, lb)
 
         def drive_callback(from_index, to_index):
@@ -843,13 +861,14 @@ def optimize():
                     deadline_from_departure = None
 
                     if deadline_rel is not None:
+                        # El deadline ahora es la hora límite de LLEGADA (no de salida)
                         eff_deadline = int(deadline_rel) - cl_gap
-                        wait_here_dead = int(round(extended_wait[node]))
-                        deadline_ub_eff = max(0, eff_deadline - wait_here_dead)
+                        deadline_ub_eff = max(0, eff_deadline)  # Ya no restamos wait_time
                         deadline_from_departure = eff_deadline - start_offset
                         latest_arrival_from_departure = deadline_ub_eff - start_offset
 
                         if latest_arrival_from_departure is not None:
+                            # Slack = cuánto tiempo tiene de margen antes del cierre
                             deadline_slack = latest_arrival_from_departure - arrival_from_departure
 
                     truck_departure_abs = (

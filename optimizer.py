@@ -654,13 +654,32 @@ def optimize():
                 if op_gap < 0: op_gap = 0
                 if cl_gap < 0: cl_gap = 0
 
+                wait_here = int(round(extended_wait[node]))
+
                 # CAMBIO IMPORTANTE: Las ventanas se aplican a la LLEGADA, no a la salida
                 # Por eso NO restamos wait_time del deadline
                 
                 if extended_opening[node] is not None:
-                    # Hora más temprana de LLEGADA permitida
-                    eff_open = int(extended_opening[node]) - op_gap
-                    lb = max(lb, max(0, eff_open))
+                    # Hora más temprana de LLEGADA permitida (con gap)
+                    eff_open_arrival = int(extended_opening[node]) - op_gap
+                    lb = max(lb, max(0, eff_open_arrival))
+                    
+                    # NUEVA LÓGICA: Si hay gap, el camión puede llegar temprano pero debe esperar
+                    # hasta la apertura real para poder salir
+                    if op_gap > 0:
+                        opening_real = int(extended_opening[node])  # Sin gap
+                        # El camión NO puede partir antes de: opening_real + wait_time
+                        # Esto se modela aumentando el lower bound de tiempo acumulado
+                        # PERO esto se maneja mejor con SlackVar...
+                        
+                        # Solución simple: ajustar el lb mínimo considerando que
+                        # si llegas en eff_open_arrival, debes esperar hasta opening_real,
+                        # luego esperar wait_here, y entonces partir
+                        # Entonces el "tiempo efectivo" mínimo es opening_real + wait_here
+                        # PERO esto no es el tiempo de llegada, es el tiempo de salida
+                        
+                        # La forma correcta: usar el SlackVar
+                        pass  # Lo haremos después del SetRange
 
                 if extended_deadline[node] is not None:
                     # Hora más tardía de LLEGADA permitida (NO restamos wait_time)
@@ -672,11 +691,10 @@ def optimize():
                     if ub < lb:
                         loc_id = extended_locations[node].get('id', node)
                         loc_name = extended_locations[node].get('identificador', 'unknown')
-                        wait_here = int(round(extended_wait[node]))
                         print(f"⚠️ ADVERTENCIA: Ubicación {loc_id} ({loc_name}) tiene ventana imposible:")
                         print(f"   - Debe llegar después de: {lb} min desde salida (open={extended_opening[node]}, gap={op_gap})")
                         print(f"   - Debe llegar antes de: {ub} min desde salida (close={extended_deadline[node]}, gap={cl_gap})")
-                        print(f"   - Tiempo de espera: {wait_here} min (NO afecta la ventana de llegada)")
+                        print(f"   - Tiempo de espera: {wait_here} min")
 
                 if extended_opening[node] is not None or extended_deadline[node] is not None:
                     if lb <= ub:
@@ -684,6 +702,37 @@ def optimize():
                     else:
                         # Si la ventana es imposible, usar solo el límite inferior
                         time_dimension.CumulVar(idx).SetRange(lb, lb)
+                
+                # IMPLEMENTACIÓN: Forzar espera hasta apertura real si hay opening_gap
+                if extended_opening[node] is not None:
+                    op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
+                    if op_gap > 0:
+                        opening_real = int(extended_opening[node])  # Apertura real (SIN gap)
+                        wait_here = int(round(extended_wait[node]))
+                        
+                        # SlackVar(idx) = tiempo que el vehículo espera en el nodo
+                        # = CumulVar(next) - CumulVar(current) - TransitTime
+                        #
+                        # El TransitTime ya incluye wait_here (por el time_callback)
+                        # Necesitamos agregar espera adicional si llegamos antes de opening_real
+                        #
+                        # Queremos: Si Cumul(idx) < opening_real, entonces debemos esperar
+                        # hasta opening_real antes de contar wait_here
+                        #
+                        # Total de espera = max(0, opening_real - Cumul(idx)) + wait_here
+                        #
+                        # Como el time_callback ya suma wait_here al transit,
+                        # necesitamos que Slack >= max(0, opening_real - Cumul(idx))
+                        #
+                        # SetSlackVarSoftLowerBound no acepta expresiones, solo valores fijos
+                        # La solución es usar una constraint adicional:
+                        
+                        slack_var = time_dimension.SlackVar(idx)
+                        arrival_var = time_dimension.CumulVar(idx)
+                        
+                        # Constraint: slack_var >= opening_real - arrival_var
+                        # O sea: arrival_var + slack_var >= opening_real
+                        solver.Add(arrival_var + slack_var >= opening_real)
 
         def drive_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)

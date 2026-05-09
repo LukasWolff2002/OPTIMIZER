@@ -85,7 +85,7 @@ def optimize():
          * Time  = viaje + espera + reload  [para ventanas/secuenciación]
          * Drive = SOLO viaje               [para tope de 8h]
       - Hora de salida independiente por camión
-      - Ventanas en nodos (Corregidas)
+      - Ventanas en nodos (MODIFICADAS: sin lower bound, permite llegada temprana)
       - Límite de paradas por vehículo (Stops)
       - NUEVA REGLA: LA VEGA puede ir en rutas CENCOSUD solo si es la primera parada
     """
@@ -647,97 +647,62 @@ def optimize():
                 time_dimension.CumulVar(start_idx).SetRange(0, 0)
                 vehicle_start_offsets[v] = 0
 
+        # ============================================================================
+        # NUEVA SECCIÓN: VENTANAS HORARIAS SIN LOWER BOUND (PERMITE LLEGADA TEMPRANA)
+        # ============================================================================
         if reference_departure_minutes is not None:
             for node in range(1, num_nodes):
                 idx = manager.NodeToIndex(node)
-                lb = 0     
-                ub = 10**7  
-
-                op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
-                cl_gap = int(extended_closing_gap[node]) if extended_closing_gap[node] is not None else 0
-                if op_gap < 0: op_gap = 0
-                if cl_gap < 0: cl_gap = 0
-
+                
                 wait_here = int(round(extended_wait[node]))
-
-                # CAMBIO IMPORTANTE: Las ventanas se aplican a la LLEGADA, no a la salida
-                # Por eso NO restamos wait_time del deadline
                 
-                if extended_opening[node] is not None:
-                    # Hora más temprana de LLEGADA permitida (con gap)
-                    eff_open_arrival = int(extended_opening[node]) - op_gap
-                    lb = max(lb, max(0, eff_open_arrival))
-                    
-                    # NUEVA LÓGICA: Si hay gap, el camión puede llegar temprano pero debe esperar
-                    # hasta la apertura real para poder salir
-                    if op_gap > 0:
-                        opening_real = int(extended_opening[node])  # Sin gap
-                        # El camión NO puede partir antes de: opening_real + wait_time
-                        # Esto se modela aumentando el lower bound de tiempo acumulado
-                        # PERO esto se maneja mejor con SlackVar...
-                        
-                        # Solución simple: ajustar el lb mínimo considerando que
-                        # si llegas en eff_open_arrival, debes esperar hasta opening_real,
-                        # luego esperar wait_here, y entonces partir
-                        # Entonces el "tiempo efectivo" mínimo es opening_real + wait_here
-                        # PERO esto no es el tiempo de llegada, es el tiempo de salida
-                        
-                        # La forma correcta: usar el SlackVar
-                        pass  # Lo haremos después del SetRange
-
+                # NUEVO ENFOQUE: El camión puede llegar en CUALQUIER momento (sin lower bound)
+                # Solo aplicamos restricciones de cierre (deadline) y apertura real
+                
+                # 1. DEADLINE (upper bound): No puede llegar DESPUÉS de este tiempo
                 if extended_deadline[node] is not None:
-                    # Hora más tardía de LLEGADA permitida (NO restamos wait_time)
+                    cl_gap = int(extended_closing_gap[node]) if extended_closing_gap[node] is not None else 0
+                    if cl_gap < 0: 
+                        cl_gap = 0
+                    
                     eff_deadline = int(extended_deadline[node]) - cl_gap
-                    ub = min(ub, max(0, eff_deadline))
-
-                # VALIDACIÓN: Verificar si la ventana es factible
-                if extended_opening[node] is not None and extended_deadline[node] is not None:
-                    if ub < lb:
-                        loc_id = extended_locations[node].get('id', node)
-                        loc_name = extended_locations[node].get('identificador', 'unknown')
-                        print(f"⚠️ ADVERTENCIA: Ubicación {loc_id} ({loc_name}) tiene ventana imposible:")
-                        print(f"   - Debe llegar después de: {lb} min desde salida (open={extended_opening[node]}, gap={op_gap})")
-                        print(f"   - Debe llegar antes de: {ub} min desde salida (close={extended_deadline[node]}, gap={cl_gap})")
-                        print(f"   - Tiempo de espera: {wait_here} min")
-
-                if extended_opening[node] is not None or extended_deadline[node] is not None:
-                    if lb <= ub:
-                        time_dimension.CumulVar(idx).SetRange(lb, ub)
-                    else:
-                        # Si la ventana es imposible, usar solo el límite inferior
-                        time_dimension.CumulVar(idx).SetRange(lb, lb)
+                    ub = max(0, eff_deadline)
+                    
+                    # Establecer solo upper bound
+                    time_dimension.CumulVar(idx).SetRange(0, ub)
+                    
+                    # Log para debugging
+                    loc_id = extended_locations[node].get('id', node)
+                    loc_name = extended_locations[node].get('identificador', 'unknown')
+                    deadline_clock = _fmt_hhmm((reference_departure_minutes + eff_deadline) % (24*60))
+                    print(f"📅 {loc_name} (ID {loc_id}): debe llegar antes de {deadline_clock} "
+                          f"(deadline={eff_deadline} min desde salida, gap={cl_gap} min)")
                 
-                # IMPLEMENTACIÓN: Forzar espera hasta apertura real si hay opening_gap
-                # IMPORTANTE: Solo aplicar si existe open_time (extended_opening no es None)
+                # 2. APERTURA REAL: No puede SALIR antes de que la tienda abra
                 if extended_opening[node] is not None:
+                    opening_real = int(extended_opening[node])  # Hora real de apertura (sin gap)
+                    
+                    arrival_var = time_dimension.CumulVar(idx)
+                    
+                    # El camión puede llegar cuando sea, pero debe esperar hasta opening_real
+                    # para poder empezar la descarga (y luego esperar wait_here adicional)
+                    # Constraint: arrival + wait_here >= opening_real
+                    # Lo que significa: no puede salir antes de opening_real
+                    solver.Add(arrival_var + wait_here >= opening_real)
+                    
+                    # Log para debugging
+                    loc_id = extended_locations[node].get('id', node)
+                    loc_name = extended_locations[node].get('identificador', 'unknown')
                     op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
-                    if op_gap > 0:
-                        opening_real = int(extended_opening[node])  # Apertura real (SIN gap)
-                        wait_here = int(round(extended_wait[node]))
-                        
-                        # SlackVar(idx) = tiempo que el vehículo espera en el nodo
-                        # = CumulVar(next) - CumulVar(current) - TransitTime
-                        #
-                        # El TransitTime ya incluye wait_here (por el time_callback)
-                        # Necesitamos agregar espera adicional si llegamos antes de opening_real
-                        #
-                        # Queremos: Si Cumul(idx) < opening_real, entonces debemos esperar
-                        # hasta opening_real antes de contar wait_here
-                        #
-                        # Total de espera = max(0, opening_real - Cumul(idx)) + wait_here
-                        #
-                        # Como el time_callback ya suma wait_here al transit,
-                        # necesitamos que Slack >= max(0, opening_real - Cumul(idx))
-                        #
-                        # SetSlackVarSoftLowerBound no acepta expresiones, solo valores fijos
-                        # La solución es usar una constraint adicional:
-                        
-                        slack_var = time_dimension.SlackVar(idx)
-                        arrival_var = time_dimension.CumulVar(idx)
-                        
-                        # Constraint: slack_var >= opening_real - arrival_var
-                        # O sea: arrival_var + slack_var >= opening_real
-                        solver.Add(arrival_var + slack_var >= opening_real)
+                    opening_clock = _fmt_hhmm((reference_departure_minutes + opening_real) % (24*60))
+                    earliest_arrival_clock = _fmt_hhmm((reference_departure_minutes + opening_real - op_gap) % (24*60))
+                    
+                    print(f"📍 {loc_name} (ID {loc_id}):")
+                    print(f"   ✓ Puede llegar desde las {earliest_arrival_clock} (gap={op_gap} min)")
+                    print(f"   ✓ No puede salir antes de {opening_clock} (apertura real)")
+                    print(f"   ✓ Tiempo de espera/descarga: {wait_here} min")
+
+        # ============================================================================
 
         def drive_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)

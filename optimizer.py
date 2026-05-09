@@ -283,23 +283,7 @@ def optimize():
                 if closing_gap < 0:
                     closing_gap = 0
 
-            # --- NUEVO: Cálculo corregido de cierre sin salto de día ---
-            close_time_raw = loc.get("close_time")
-            deadline_minutes_rel = None
-            if reference_departure_minutes is not None and close_time_raw:
-                try:
-                    if "T" in str(close_time_raw):
-                        close_dt = datetime.fromisoformat(close_time_raw)
-                        close_minutes = close_dt.hour * 60 + close_dt.minute
-                    else:
-                        close_minutes = _parse_departure_minutes(str(close_time_raw))
-                    delta = close_minutes - reference_departure_minutes
-                    # SE ELIMINÓ EL IF DELTA < 0 AQUI
-                    deadline_minutes_rel = int(delta)
-                except Exception:
-                    deadline_minutes_rel = None
-
-            # --- NUEVO: Cálculo corregido de apertura sin salto de día ---
+            # --- Cálculo de apertura y cierre con manejo de salto de día ---
             open_time_raw = loc.get("open_time")
             opening_minutes_rel = None
             if reference_departure_minutes is not None and open_time_raw:
@@ -310,10 +294,30 @@ def optimize():
                     else:
                         open_minutes = _parse_departure_minutes(str(open_time_raw))
                     delta_open = open_minutes - reference_departure_minutes
-                    # SE ELIMINÓ EL IF DELTA_OPEN < 0 AQUI
+                    # Si delta es muy negativo (ej: open=08:00, depart=22:50 => delta=-890)
+                    # significa que la apertura es al DÍA SIGUIENTE
+                    if delta_open < -12 * 60:  # Si es más de 12 horas antes, asumimos día siguiente
+                        delta_open += 24 * 60
                     opening_minutes_rel = int(delta_open)
                 except Exception:
                     opening_minutes_rel = None
+
+            close_time_raw = loc.get("close_time")
+            deadline_minutes_rel = None
+            if reference_departure_minutes is not None and close_time_raw:
+                try:
+                    if "T" in str(close_time_raw):
+                        close_dt = datetime.fromisoformat(close_time_raw)
+                        close_minutes = close_dt.hour * 60 + close_dt.minute
+                    else:
+                        close_minutes = _parse_departure_minutes(str(close_time_raw))
+                    delta = close_minutes - reference_departure_minutes
+                    # Si delta es muy negativo, significa que el cierre es al DÍA SIGUIENTE
+                    if delta < -12 * 60:  # Si es más de 12 horas antes, asumimos día siguiente
+                        delta += 24 * 60
+                    deadline_minutes_rel = int(delta)
+                except Exception:
+                    deadline_minutes_rel = None
 
             identificador = (loc.get("identificador", "") or "").upper()
             requires_refrigeration = any(
@@ -704,6 +708,7 @@ def optimize():
                         time_dimension.CumulVar(idx).SetRange(lb, lb)
                 
                 # IMPLEMENTACIÓN: Forzar espera hasta apertura real si hay opening_gap
+                # IMPORTANTE: Solo aplicar si existe open_time (extended_opening no es None)
                 if extended_opening[node] is not None:
                     op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
                     if op_gap > 0:

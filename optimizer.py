@@ -116,6 +116,28 @@ def optimize():
         job_id = data.get("job_id")
         update_job_status(job_id, "preparacion", "Recibiendo datos y calculando matrices...", 10)
 
+        # --- Día de semana: para segunda ventana horaria de Nicolas Palma (Jue/Vie/Sáb) ---
+        # El request puede enviar "fecha" o "date" en formato "YYYY-MM-DD" o ISO datetime.
+        # Si no viene, usamos la fecha actual del servidor.
+        _fecha_str = data.get("fecha") or data.get("date")
+        if _fecha_str:
+            try:
+                if "T" in str(_fecha_str):
+                    _dia_semana = datetime.fromisoformat(str(_fecha_str)).weekday()
+                else:
+                    from datetime import date as _date_cls
+                    _dia_semana = _date_cls.fromisoformat(str(_fecha_str)).weekday()
+            except Exception:
+                _dia_semana = datetime.now().weekday()
+        else:
+            _dia_semana = datetime.now().weekday()
+        # 0=Lun, 1=Mar, 2=Mié, 3=Jue, 4=Vie, 5=Sáb, 6=Dom
+        _DIA_NOMBRES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+        es_dia_segunda_ventana_np = _dia_semana in (3, 4, 5)  # Jue, Vie, Sáb
+        print(f"📆 Día detectado: {_DIA_NOMBRES[_dia_semana]} "
+              f"(weekday={_dia_semana}) — "
+              f"{'✅ Aplica 2da ventana Nicolas Palma' if es_dia_segunda_ventana_np else '⏭ Sin 2da ventana'}")
+
         # --- Datos base requeridos ---
         locations = data["locations"]
         base_num_vehicles = data["max_vehicles"]
@@ -422,13 +444,17 @@ def optimize():
         prioridad_tottus_tag = "TOTTUS CD"
         prioridad_unimarc_tag = "UNIMARC CD"
 
-        is_pa_node, is_lv_node, is_tottus_node, is_unimarc_node = [], [], [], []
+        is_pa_node, is_lv_node, is_tottus_node, is_unimarc_node, is_nicolas_palma_node = [], [], [], [], []
         for loc in extended_locations:
             ident = (loc.get("identificador", "") or "").upper()
             is_pa_node.append(prioridad_pa_tag in ident)
             is_lv_node.append(prioridad_lv_tag in ident)
             is_tottus_node.append(prioridad_tottus_tag in ident)
             is_unimarc_node.append(prioridad_unimarc_tag in ident)
+            # Doble ventana horaria Jue/Vie/Sáb: detectar por nombre (acepta tildes y variantes)
+            is_nicolas_palma_node.append(
+                "NICOLAS PALMA" in ident or "NICOLÁS PALMA" in ident
+            )
 
         # MODIFICACIÓN: Permitir LA VEGA en rutas CENCOSUD
         MODE_FREE, MODE_W, MODE_C = 0, 1, 2
@@ -648,59 +674,144 @@ def optimize():
                 vehicle_start_offsets[v] = 0
 
         # ============================================================================
-        # NUEVA SECCIÓN: VENTANAS HORARIAS SIN LOWER BOUND (PERMITE LLEGADA TEMPRANA)
+        # VENTANAS HORARIAS — llegada temprana permitida + doble ventana (Nicolas Palma)
+        #
+        # Para nodos normales: comportamiento original (sin lower bound en llegada,
+        #   solo deadline como upper bound y constraint de apertura en salida).
+        #
+        # Para "NICOLAS PALMA" en Jue/Vie/Sáb: se agrega una SEGUNDA ventana fija
+        #   20:00–23:59, usando la técnica OR de OR-Tools:
+        #     Max(w1_ub - arrival, arrival - sv_open) >= 0
+        #   → el camión debe llegar ANTES del cierre de ventana 1
+        #     O DESPUÉS de las 20:00 (ventana 2).
         # ============================================================================
+
+        # Constantes de la segunda ventana (fijas en código, minutos desde medianoche)
+        NP_SV_OPEN_ABS  = 20 * 60        # 20:00 → 1200 min
+        NP_SV_CLOSE_ABS = 23 * 60 + 59   # 23:59 → 1439 min
+
         if reference_departure_minutes is not None:
             for node in range(1, num_nodes):
-                idx = manager.NodeToIndex(node)
-                
+                idx       = manager.NodeToIndex(node)
                 wait_here = int(round(extended_wait[node]))
-                
-                # NUEVO ENFOQUE: El camión puede llegar en CUALQUIER momento (sin lower bound)
-                # Solo aplicamos restricciones de cierre (deadline) y apertura real
-                
-                # 1. DEADLINE (upper bound): No puede llegar DESPUÉS de este tiempo
-                if extended_deadline[node] is not None:
-                    cl_gap = int(extended_closing_gap[node]) if extended_closing_gap[node] is not None else 0
-                    if cl_gap < 0: 
-                        cl_gap = 0
-                    
-                    eff_deadline = int(extended_deadline[node]) - cl_gap
-                    ub = max(0, eff_deadline)
-                    
-                    # Establecer solo upper bound
-                    time_dimension.CumulVar(idx).SetRange(0, ub)
-                    
-                    # Log para debugging
-                    loc_id = extended_locations[node].get('id', node)
-                    loc_name = extended_locations[node].get('identificador', 'unknown')
-                    deadline_clock = _fmt_hhmm((reference_departure_minutes + eff_deadline) % (24*60))
-                    print(f"📅 {loc_name} (ID {loc_id}): debe llegar antes de {deadline_clock} "
-                          f"(deadline={eff_deadline} min desde salida, gap={cl_gap} min)")
-                
-                # 2. APERTURA REAL: No puede SALIR antes de que la tienda abra
-                if extended_opening[node] is not None:
-                    opening_real = int(extended_opening[node])  # Hora real de apertura (sin gap)
-                    
+                loc_id    = extended_locations[node].get('id', node)
+                loc_name  = extended_locations[node].get('identificador', 'unknown')
+
+                use_double_window = is_nicolas_palma_node[node] and es_dia_segunda_ventana_np
+
+                if use_double_window:
+                    # ------------------------------------------------------------------
+                    # DOBLE VENTANA — Nicolas Palma — Jue / Vie / Sáb
+                    #
+                    # Ventana 1 (del JSON): apertura normal → cierre normal
+                    # Ventana 2 (hardcoded): 20:00 → 23:59
+                    #
+                    # El camión DEBE caer en una de las dos ventanas.
+                    # Si no hay ventana 1 en el JSON, se usa solo ventana 2.
+                    # ------------------------------------------------------------------
                     arrival_var = time_dimension.CumulVar(idx)
-                    
-                    # El camión puede llegar cuando sea, pero debe esperar hasta opening_real
-                    # para poder empezar la descarga (y luego esperar wait_here adicional)
-                    # Constraint: arrival + wait_here >= opening_real
-                    # Lo que significa: no puede salir antes de opening_real
-                    solver.Add(arrival_var + wait_here >= opening_real)
-                    
-                    # Log para debugging
-                    loc_id = extended_locations[node].get('id', node)
-                    loc_name = extended_locations[node].get('identificador', 'unknown')
-                    op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
-                    opening_clock = _fmt_hhmm((reference_departure_minutes + opening_real) % (24*60))
-                    earliest_arrival_clock = _fmt_hhmm((reference_departure_minutes + opening_real - op_gap) % (24*60))
-                    
-                    print(f"📍 {loc_name} (ID {loc_id}):")
-                    print(f"   ✓ Puede llegar desde las {earliest_arrival_clock} (gap={op_gap} min)")
-                    print(f"   ✓ No puede salir antes de {opening_clock} (apertura real)")
-                    print(f"   ✓ Tiempo de espera/descarga: {wait_here} min")
+
+                    # Ventana 2 en minutos relativos al reference_departure
+                    sv_open_rel  = NP_SV_OPEN_ABS  - reference_departure_minutes
+                    sv_close_rel = NP_SV_CLOSE_ABS - reference_departure_minutes
+                    # Corrección por salto de día (ej: salida 22:00, ventana 20:00 = "mañana")
+                    if sv_open_rel  < -12 * 60: sv_open_rel  += 24 * 60
+                    if sv_close_rel < -12 * 60: sv_close_rel += 24 * 60
+
+                    # Leer límites de ventana 1 del JSON (pueden ser None si no vienen)
+                    w1_ub        = None   # upper bound de llegada (deadline del JSON)
+                    w1_open_real = None   # apertura real de la tienda (del JSON)
+
+                    if extended_deadline[node] is not None:
+                        cl_gap = max(0, int(extended_closing_gap[node] or 0))
+                        w1_ub  = max(0, int(extended_deadline[node]) - cl_gap)
+
+                    if extended_opening[node] is not None:
+                        w1_open_real = int(extended_opening[node])
+
+                    if w1_ub is not None:
+                        # Hay ventana 1 → aplicar OR(ventana1, ventana2)
+
+                        # Upper bound global: el más tardío de ambas ventanas
+                        overall_ub = max(w1_ub, sv_close_rel)
+                        arrival_var.SetRange(0, overall_ub)
+
+                        # Restricción OR de intervalos (ventanas no solapadas):
+                        #   Max(w1_ub - arrival, arrival - sv_open_rel) >= 0
+                        #   → arrival <= w1_ub   O   arrival >= sv_open_rel
+                        if w1_ub < sv_open_rel:
+                            solver.Add(
+                                solver.Max(w1_ub - arrival_var, arrival_var - sv_open_rel) >= 0
+                            )
+                        # Si w1_ub >= sv_open_rel las ventanas se solapan → basta SetRange
+
+                        # Restricción de apertura — versión OR:
+                        #   En ventana 1: arrival + wait >= w1_open_real
+                        #   En ventana 2: arrival >= sv_open_rel - wait  (llega antes y espera)
+                        #   Combinado: Max(arrival + wait - w1_open_real,
+                        #                  arrival - max(0, sv_open_rel - wait)) >= 0
+                        if w1_open_real is not None:
+                            sv_earliest = max(0, sv_open_rel - wait_here)
+                            solver.Add(
+                                solver.Max(
+                                    arrival_var + wait_here - w1_open_real,
+                                    arrival_var - sv_earliest
+                                ) >= 0
+                            )
+
+                        v1_open_str  = (_fmt_hhmm((reference_departure_minutes + w1_open_real) % (24 * 60))
+                                        if w1_open_real is not None else "sin apertura")
+                        v1_close_str = _fmt_hhmm((reference_departure_minutes + w1_ub) % (24 * 60))
+
+                    else:
+                        # No hay ventana 1 → solo aplicar ventana 2 como único límite
+                        arrival_var.SetRange(0, sv_close_rel)
+                        v1_open_str  = "—"
+                        v1_close_str = "sin cierre"
+
+                    sv_open_clock  = _fmt_hhmm((reference_departure_minutes + sv_open_rel)  % (24 * 60))
+                    sv_close_clock = _fmt_hhmm((reference_departure_minutes + sv_close_rel) % (24 * 60))
+                    dia_str        = _DIA_NOMBRES[_dia_semana] if _dia_semana < 7 else "?"
+
+                    print(f"🌙 DOBLE VENTANA ({dia_str}) — {loc_name} (ID {loc_id}):")
+                    print(f"   Ventana 1 (JSON):   {v1_open_str} → {v1_close_str}")
+                    print(f"   Ventana 2 (fija):   {sv_open_clock} → {sv_close_clock}")
+
+                else:
+                    # ------------------------------------------------------------------
+                    # VENTANA SIMPLE — comportamiento original sin cambios
+                    # ------------------------------------------------------------------
+
+                    # 1. DEADLINE (upper bound): No puede llegar DESPUÉS de este tiempo
+                    if extended_deadline[node] is not None:
+                        cl_gap = int(extended_closing_gap[node]) if extended_closing_gap[node] is not None else 0
+                        if cl_gap < 0:
+                            cl_gap = 0
+
+                        eff_deadline = int(extended_deadline[node]) - cl_gap
+                        ub = max(0, eff_deadline)
+
+                        time_dimension.CumulVar(idx).SetRange(0, ub)
+
+                        deadline_clock = _fmt_hhmm((reference_departure_minutes + eff_deadline) % (24 * 60))
+                        print(f"📅 {loc_name} (ID {loc_id}): debe llegar antes de {deadline_clock} "
+                              f"(deadline={eff_deadline} min desde salida, gap={cl_gap} min)")
+
+                    # 2. APERTURA REAL: No puede SALIR antes de que la tienda abra
+                    if extended_opening[node] is not None:
+                        opening_real = int(extended_opening[node])
+
+                        arrival_var = time_dimension.CumulVar(idx)
+                        solver.Add(arrival_var + wait_here >= opening_real)
+
+                        op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
+                        opening_clock          = _fmt_hhmm((reference_departure_minutes + opening_real) % (24 * 60))
+                        earliest_arrival_clock = _fmt_hhmm((reference_departure_minutes + opening_real - op_gap) % (24 * 60))
+
+                        print(f"📍 {loc_name} (ID {loc_id}):")
+                        print(f"   ✓ Puede llegar desde las {earliest_arrival_clock} (gap={op_gap} min)")
+                        print(f"   ✓ No puede salir antes de {opening_clock} (apertura real)")
+                        print(f"   ✓ Tiempo de espera/descarga: {wait_here} min")
 
         # ============================================================================
 

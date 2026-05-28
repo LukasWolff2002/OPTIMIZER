@@ -8,7 +8,6 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-
 # ---------------------------------------------------------------------
 # Conexión a Redis y Función de Estado
 # ---------------------------------------------------------------------
@@ -341,6 +340,23 @@ def optimize():
                     deadline_minutes_rel = int(delta)
                 except Exception:
                     deadline_minutes_rel = None
+
+            # ── Corrección: ventana cruzando medianoche ────────────────────────────
+            # Caso: open=23:00, close=05:00, depart=01:00
+            #   Sin corrección: opening_rel=1320, deadline_rel=240 → IMPOSIBLE
+            #   Con corrección: opening_rel=-120 (ya abierto), deadline_rel=240 ✓
+            #
+            # Regla: si 0 < deadline_rel < opening_rel, la ventana cruza medianoche
+            # y el camión ya salió DESPUÉS de que abrió → restar 24h a opening_rel.
+            if (opening_minutes_rel is not None and deadline_minutes_rel is not None
+                    and 0 < deadline_minutes_rel < opening_minutes_rel):
+                opening_minutes_rel -= 24 * 60
+                _loc_ident_debug = (loc.get("identificador") or "?")
+                print(f"🌙 Ventana cross-midnight corregida — {_loc_ident_debug}: "
+                      f"apertura={_fmt_hhmm((reference_departure_minutes + opening_minutes_rel) % (24 * 60))} "
+                      f"(ya abierta al salir), "
+                      f"cierre={_fmt_hhmm((reference_departure_minutes + deadline_minutes_rel) % (24 * 60))}")
+            # ──────────────────────────────────────────────────────────────────────
 
             identificador = (loc.get("identificador", "") or "").upper()
             requires_refrigeration = any(

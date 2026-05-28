@@ -8,7 +8,6 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-
 # ---------------------------------------------------------------------
 # Conexión a Redis y Función de Estado
 # ---------------------------------------------------------------------
@@ -335,12 +334,33 @@ def optimize():
                     else:
                         close_minutes = _parse_departure_minutes(str(close_time_raw))
                     delta = close_minutes - reference_departure_minutes
-                    # Si delta es muy negativo, significa que el cierre es al DÍA SIGUIENTE
-                    if delta < -12 * 60:  # Si es más de 12 horas antes, asumimos día siguiente
+                    # Si el cierre queda negativo respecto a la salida de referencia,
+                    # siempre significa que es el DÍA SIGUIENTE.
+                    # Esto cubre salidas nocturnas (ej: 23:00) con tiendas que cierran
+                    # durante el día siguiente (ej: 12:00, 15:00 → delta negativo pero
+                    # el threshold viejo de -12h no los captaba).
+                    if delta < 0:
                         delta += 24 * 60
                     deadline_minutes_rel = int(delta)
                 except Exception:
                     deadline_minutes_rel = None
+
+            # ── Corrección: ventana cruzando medianoche ────────────────────────────
+            # Caso: open=23:00, close=05:00, depart=01:00
+            #   Sin corrección: opening_rel=1320, deadline_rel=240 → IMPOSIBLE
+            #   Con corrección: opening_rel=-120 (ya abierto), deadline_rel=240 ✓
+            #
+            # Regla: si 0 < deadline_rel < opening_rel, la ventana cruza medianoche
+            # y el camión ya salió DESPUÉS de que abrió → restar 24h a opening_rel.
+            if (opening_minutes_rel is not None and deadline_minutes_rel is not None
+                    and 0 < deadline_minutes_rel < opening_minutes_rel):
+                opening_minutes_rel -= 24 * 60
+                _loc_ident_debug = (loc.get("identificador") or "?")
+                print(f"🌙 Ventana cross-midnight corregida — {_loc_ident_debug}: "
+                      f"apertura={_fmt_hhmm((reference_departure_minutes + opening_minutes_rel) % (24 * 60))} "
+                      f"(ya abierta al salir), "
+                      f"cierre={_fmt_hhmm((reference_departure_minutes + deadline_minutes_rel) % (24 * 60))}")
+            # ──────────────────────────────────────────────────────────────────────
 
             identificador = (loc.get("identificador", "") or "").upper()
             requires_refrigeration = any(
@@ -687,9 +707,24 @@ def optimize():
                     offset = dep_abs - reference_departure_minutes
                     if offset < 0:
                         offset += 24 * 60
+                    # Si el offset supera 12 horas, el camión probablemente salió el día
+                    # ANTERIOR a la referencia (ej: referencia=01:00, camión=23:00 → offset
+                    # calculado en bruto=1320 min, pero en realidad salió 2h ANTES → -120).
+                    # Restando 24h obtenemos el offset real negativo, y OR-Tools lo interpreta
+                    # correctamente gracias al slack de la dimensión Time.
+                    elif offset > 12 * 60:
+                        offset -= 24 * 60
+                        print(f"🌙 Offset cross-midnight corregido para vehículo base {base_idx}: "
+                              f"{offset + 24*60} min → {offset} min "
+                              f"({_fmt_hhmm(dep_abs)} salió antes que referencia {_fmt_hhmm(reference_departure_minutes)})")
                 start_idx = routing.Start(v)
-                time_dimension.CumulVar(start_idx).SetRange(offset, offset)
-                vehicle_start_offsets[v] = offset
+                # Si el offset es negativo (salida antes de la referencia), el camión
+                # ya lleva |offset| minutos en ruta cuando empieza el marco de referencia.
+                # CumulVar no puede ser negativo, así que lo fijamos en 0 y las
+                # ventanas horarias de los nodos se ajustan naturalmente vía slack.
+                effective_start = max(0, offset)
+                time_dimension.CumulVar(start_idx).SetRange(effective_start, effective_start)
+                vehicle_start_offsets[v] = offset  # guardamos el offset real (puede ser negativo)
         else:
             for v in range(num_vehicles):
                 start_idx = routing.Start(v)

@@ -650,7 +650,29 @@ def optimize():
             return travel + service
 
         time_cb = routing.RegisterTransitCallback(time_callback)
-        routing.AddDimension(time_cb, 0, 10**7, False, "Time")
+
+        # -----------------------------------------------------------------------
+        # SLACK de espera en nodos:
+        # Con slack=0 OR-Tools NO puede modelar espera (el CumulVar es estrictamente
+        # la suma de tránsitos acumulados). Esto hacía infactible cualquier ruta con
+        # salida temprana (ej: 01:00 AM) y aperturas tardías (ej: 08:00 AM).
+        #
+        # El slack se calcula como la apertura más tardía relativa al reference_departure
+        # + un buffer de 120 min, garantizando que el solver siempre pueda modelar
+        # "el camión llega temprano y espera hasta que abra".
+        #
+        # IMPORTANTE: la espera NO cuenta como tiempo de manejo — la dimensión Drive
+        # usa drive_callback (solo viaje) sin slack, así que Drive sigue siendo puro.
+        # -----------------------------------------------------------------------
+        _max_opening_rel = max(
+            (int(v) for v in extended_opening[1:] if v is not None),
+            default=0
+        )
+        slack_tiempo_espera = max(_max_opening_rel + 120, 120)
+        print(f"⏳ Slack de espera habilitado: {slack_tiempo_espera} min "
+              f"(apertura más tardía: {_max_opening_rel} min desde salida referencia)")
+
+        routing.AddDimension(time_cb, slack_tiempo_espera, 10**7, False, "Time")
         time_dimension = routing.GetDimensionOrDie("Time")
 
         vehicle_start_offsets = {}
@@ -984,6 +1006,15 @@ def optimize():
                     if departure_from_departure < 0:
                         departure_from_departure = 0
 
+                    # Tiempo de espera real en el nodo (llegó antes de la apertura).
+                    # Fórmula: apertura_rel - time_cumul (ambos en frame de reference_departure).
+                    # Si el camión llegó DESPUÉS de la apertura → 0.
+                    # No se suma al Drive (la dimensión Drive es solo viaje).
+                    if extended_opening[node] is not None:
+                        waiting_at_node_minutes = max(0, int(extended_opening[node]) - int(time_cumul))
+                    else:
+                        waiting_at_node_minutes = 0
+
                     deadline_rel = extended_deadline[node]          
                     deadline_ub_eff = None
                     deadline_slack = None
@@ -1057,6 +1088,7 @@ def optimize():
                             "eta_clock":  eta_clock,   
                             "etd_clock":  etd_clock,   
                             "wait_minutes": int(wait_here),
+                            "waiting_at_node_minutes": int(waiting_at_node_minutes),
                             "open_clock":       open_clock,       
                             "close_clock":      close_clock,      
                             "open_eff_clock":   open_eff_clock,   

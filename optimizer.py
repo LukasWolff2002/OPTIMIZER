@@ -284,7 +284,7 @@ def optimize():
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
             # Limitar tiempo de espera a máximo 3 horas (180 minutos)
-            MAX_WAIT_MINUTES = 1000
+            MAX_WAIT_MINUTES = 60
             if wait_minutes > MAX_WAIT_MINUTES:
                 wait_minutes = MAX_WAIT_MINUTES
 

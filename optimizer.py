@@ -902,29 +902,6 @@ def optimize():
         for v in range(num_vehicles):
             stops_dimension.CumulVar(routing.End(v)).SetMax(maximo_de_paradas)
 
-        # ── RESTRICCIÓN: máximo 1 salida desde packing por camión físico ──────────
-        # Cada camión físico tiene 3 vehículos virtuales (MODE_FREE / MODE_W / MODE_C).
-        # Sin esta restricción el solver puede activar varios modos del mismo camión
-        # en paralelo, generando 2 o 3 salidas desde packing para el mismo vehículo.
-        #
-        # Implementación: para cada grupo de virtuales del mismo camión físico,
-        # contamos cuántos tienen stops > 0 (ruta activa) y limitamos ese conteo a 1.
-        # solver.IsGreaterCstVar(var, 0) devuelve 1 si var > 0, 0 si var == 0.
-        for base in range(base_num_vehicles):
-            virtuales_del_camion = [
-                v for v in range(num_vehicles) if vehicle_mapping[v] == base
-            ]
-            if len(virtuales_del_camion) <= 1:
-                continue
-            rutas_activas = [
-                solver.IsGreaterCstVar(
-                    stops_dimension.CumulVar(routing.End(v)), 0
-                )
-                for v in virtuales_del_camion
-            ]
-            solver.Add(solver.Sum(rutas_activas) <= 1)
-        # ─────────────────────────────────────────────────────────────────────────
-
         time_dimension.SetGlobalSpanCostCoefficient(50)
 
         costo_varias_rutas = True

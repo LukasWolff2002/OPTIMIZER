@@ -11,20 +11,17 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------
 # Conexión a Redis y Función de Estado
 # ---------------------------------------------------------------------
-# Buscamos la URL de Redis en las variables de entorno. 
 redis_url = os.environ.get("REDIS_URL")
 
 redis_client = None
 if redis_url:
     try:
-        # Railway usa URLs seguras (rediss://) que requieren desactivar la verificación estricta de SSL
         if redis_url.startswith("rediss://"):
             import ssl
             redis_client = redis.from_url(redis_url, ssl_cert_reqs=ssl.CERT_NONE)
         else:
             redis_client = redis.from_url(redis_url)
         
-        # Hacemos un ping para asegurar que de verdad conectó
         redis_client.ping()
         print("✅ Conectado a Redis exitosamente.")
     except Exception as e:
@@ -77,18 +74,6 @@ def _fmt_hhmm(total_minutes: int) -> str:
 
 @app.route("/optimize", methods=["POST"])
 def optimize():
-    """
-    Resuelve un VRP con:
-      - Capacidad por kg (Capacity) + palets (Palets)  [AND]
-      - Duplicación de vehículos por (viajes x modos) y exclusividad por grupo
-      - Dos dimensiones de tiempo:
-         * Time  = viaje + espera + reload  [para ventanas/secuenciación]
-         * Drive = SOLO viaje               [para tope de 8h]
-      - Hora de salida independiente por camión
-      - Ventanas en nodos (MODIFICADAS: sin lower bound, permite llegada temprana)
-      - Límite de paradas por vehículo (Stops)
-      - NUEVA REGLA: LA VEGA puede ir en rutas CENCOSUD solo si es la primera parada
-    """
     job_id = None
     
     # ---------------------- Datos fijos de negocio ---------------------
@@ -104,7 +89,6 @@ def optimize():
         if raw_data is None:
             return jsonify(error="No se recibió JSON válido"), 400
 
-        # Compat: payload puede venir como [data, truck_ids, user_id]
         if isinstance(raw_data, list):
             if len(raw_data) != 3:
                 return jsonify(error="Se esperaba [data, truck_ids, user_id]"), 400
@@ -112,13 +96,9 @@ def optimize():
         else:
             data, truck_ids, user_id = raw_data, [], None
 
-        # --- NUEVO: Extraer Job ID e iniciar progreso ---
         job_id = data.get("job_id")
         update_job_status(job_id, "preparacion", "Recibiendo datos y calculando matrices...", 10)
 
-        # --- Día de semana: para segunda ventana horaria de Nicolas Palma (Jue/Vie/Sáb) ---
-        # El request puede enviar "fecha" o "date" en formato "YYYY-MM-DD" o ISO datetime.
-        # Si no viene, usamos la fecha actual del servidor.
         _fecha_str = data.get("fecha") or data.get("date")
         if _fecha_str:
             try:
@@ -131,25 +111,24 @@ def optimize():
                 _dia_semana = datetime.now().weekday()
         else:
             _dia_semana = datetime.now().weekday()
-        # 0=Lun, 1=Mar, 2=Mié, 3=Jue, 4=Vie, 5=Sáb, 6=Dom
+        
         _DIA_NOMBRES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
-        es_dia_segunda_ventana_np = _dia_semana in (3, 4, 5)  # Jue, Vie, Sáb
+        es_dia_segunda_ventana_np = _dia_semana in (3, 4, 5) 
         print(f"📆 Día detectado: {_DIA_NOMBRES[_dia_semana]} "
               f"(weekday={_dia_semana}) — "
               f"{'✅ Aplica 2da ventana Nicolas Palma' if es_dia_segunda_ventana_np else '⏭ Sin 2da ventana'}")
 
-        # --- Datos base requeridos ---
         locations = data["locations"]
         base_num_vehicles = data["max_vehicles"]
         vehicle_capacities_base = data["vehicle_capacities"]
         distance_matrix = data["distance_matrix"]
         time_matrix = data.get("time_matrix")
 
-        # --- Opcionales / default ---
         vehicle_palets_base = data.get("vehicle_palets", [0] * base_num_vehicles)
         vehicle_consume_base = data.get("vehicle_consume", [1] * base_num_vehicles)
         vehicle_free_base = data.get("vehicle_free", [0] * base_num_vehicles)
         multiplicador_tiempo = float(data.get("multiplicador_tiempo", 1.0) or 1.0)
+        
         if multiplicador_tiempo <= 0:
             return jsonify(error="multiplicador_tiempo debe ser > 0"), 400
 
@@ -157,15 +136,11 @@ def optimize():
         if maximo_de_paradas <= 0:
             return jsonify(error="maximas_paradas_camion debe ser > 0"), 400
 
-        # tiempos (min)
-        tiempo_calculo_min = float(data.get("tiempo_calculo", 2))  # minutos
-        tiempo_calculo = int(tiempo_calculo_min * 60)              # segundos
-        HORIZON = int(data.get("max_time_per_trip", 480))          # tope de conducción (Drive)
+        tiempo_calculo_min = float(data.get("tiempo_calculo", 2))
+        tiempo_calculo = int(tiempo_calculo_min * 60)
+        HORIZON = int(data.get("max_time_per_trip", 480))
         reload_service_time = int(data.get("reload_service_time", 0))
 
-        # -----------------------------------------------------------------
-        # Horas de salida por camión
-        # -----------------------------------------------------------------
         vehicle_departure_times_raw = data.get("vehicle_departure_times") or []
         if not isinstance(vehicle_departure_times_raw, list):
             vehicle_departure_times_raw = []
@@ -218,10 +193,9 @@ def optimize():
             return jsonify(error="vehicle_palets debe ser lista de enteros"), 400
         vehicle_palets_base = [(p if p > 0 else PALLET_INF) for p in vehicle_palets_base]
 
-        # --------------------------- Modos (rutas puras) ---------------------------
-        MODE_FREE = 0   # OTHER
-        MODE_W    = 1   # WALMART
-        MODE_C    = 2   # CENCOSUD
+        MODE_FREE = 0
+        MODE_W    = 1
+        MODE_C    = 2
         MODES = (MODE_FREE, MODE_W, MODE_C)
 
         vehicle_capacities, vehicle_consume, vehicle_free, vehicle_palets = [], [], [], []
@@ -244,7 +218,6 @@ def optimize():
         max_vehicle_capacity = max(vehicle_capacities)
         depot = 0
 
-        # --------------------- Construcción de nodos extendidos -------------------
         update_job_status(job_id, "construyendo_modelo", "Agrupando ubicaciones y dividiendo demanda de carga...", 25)
         
         all_products = set()
@@ -283,7 +256,6 @@ def optimize():
 
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
-            # Limitar tiempo de espera a máximo 3 horas (180 minutos)
             MAX_WAIT_MINUTES = 10000
             if wait_minutes > MAX_WAIT_MINUTES:
                 wait_minutes = MAX_WAIT_MINUTES
@@ -305,7 +277,6 @@ def optimize():
                 if closing_gap < 0:
                     closing_gap = 0
 
-            # --- Cálculo de apertura y cierre con manejo de salto de día ---
             open_time_raw = loc.get("open_time")
             opening_minutes_rel = None
             if reference_departure_minutes is not None and open_time_raw:
@@ -316,9 +287,7 @@ def optimize():
                     else:
                         open_minutes = _parse_departure_minutes(str(open_time_raw))
                     delta_open = open_minutes - reference_departure_minutes
-                    # Si delta es muy negativo (ej: open=08:00, depart=22:50 => delta=-890)
-                    # significa que la apertura es al DÍA SIGUIENTE
-                    if delta_open < -12 * 60:  # Si es más de 12 horas antes, asumimos día siguiente
+                    if delta_open < -12 * 60:  
                         delta_open += 24 * 60
                     opening_minutes_rel = int(delta_open)
                 except Exception:
@@ -334,24 +303,12 @@ def optimize():
                     else:
                         close_minutes = _parse_departure_minutes(str(close_time_raw))
                     delta = close_minutes - reference_departure_minutes
-                    # Si el cierre queda negativo respecto a la salida de referencia,
-                    # siempre significa que es el DÍA SIGUIENTE.
-                    # Esto cubre salidas nocturnas (ej: 23:00) con tiendas que cierran
-                    # durante el día siguiente (ej: 12:00, 15:00 → delta negativo pero
-                    # el threshold viejo de -12h no los captaba).
                     if delta < 0:
                         delta += 24 * 60
                     deadline_minutes_rel = int(delta)
                 except Exception:
                     deadline_minutes_rel = None
 
-            # ── Corrección: ventana cruzando medianoche ────────────────────────────
-            # Caso: open=23:00, close=05:00, depart=01:00
-            #   Sin corrección: opening_rel=1320, deadline_rel=240 → IMPOSIBLE
-            #   Con corrección: opening_rel=-120 (ya abierto), deadline_rel=240 ✓
-            #
-            # Regla: si 0 < deadline_rel < opening_rel, la ventana cruza medianoche
-            # y el camión ya salió DESPUÉS de que abrió → restar 24h a opening_rel.
             if (opening_minutes_rel is not None and deadline_minutes_rel is not None
                     and 0 < deadline_minutes_rel < opening_minutes_rel):
                 opening_minutes_rel -= 24 * 60
@@ -360,7 +317,6 @@ def optimize():
                       f"apertura={_fmt_hhmm((reference_departure_minutes + opening_minutes_rel) % (24 * 60))} "
                       f"(ya abierta al salir), "
                       f"cierre={_fmt_hhmm((reference_departure_minutes + deadline_minutes_rel) % (24 * 60))}")
-            # ──────────────────────────────────────────────────────────────────────
 
             identificador = (loc.get("identificador", "") or "").upper()
             requires_refrigeration = any(
@@ -370,7 +326,7 @@ def optimize():
             if total_demand <= max_vehicle_capacity:
                 extended_locations.append(loc)
                 extended_demands.append(int(total_demand))
-                extended_palets.append(palets_total)           
+                extended_palets.append(palets_total)            
                 extended_wait.append(wait_minutes)
                 extended_deadline.append(deadline_minutes_rel)
                 extended_opening.append(opening_minutes_rel)
@@ -402,7 +358,7 @@ def optimize():
                         palets_assigned = min(palets_assigned, remaining_palets)
                     else:
                         split_demand = remaining_per_product.copy()
-                        palets_assigned = remaining_palets           
+                        palets_assigned = remaining_palets            
 
                     split_loc["demanda"] = {
                         p: str(split_demand[p]) for p in all_products if split_demand[p] > 0
@@ -425,7 +381,27 @@ def optimize():
         num_nodes = len(extended_locations)
         node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
 
-        # ---------------------------- Matrices extendidas --------------------------
+        # -------------------------------------------------------------------------
+        # FUNCIÓN DE PARES DE BODEGA COMPARTIDA
+        # -------------------------------------------------------------------------
+        def is_shared_warehouse_pair(from_node, to_node):
+            if from_node == depot or to_node == depot:
+                return False
+            
+            name_from = (extended_locations[from_node].get("identificador") or "").strip().upper()
+            name_to   = (extended_locations[to_node].get("identificador") or "").strip().upper()
+            
+            p1 = {"JUMBO DARK STORE COSTANERA", "JUMBO COSTANERA"}
+            if name_from in p1 and name_to in p1 and name_from != name_to:
+                return True
+            
+            p2_a = {"JUMBO 1 NORTE VIÑA DEL MAR", "JUMBO 1 NORTE VINA DEL MAR"}
+            p2_b = {"JUMBO DARK STORE VIÑA DEL MAR", "JUMBO DARK STORE VINA DEL MAR"}
+            if (name_from in p2_a and name_to in p2_b) or (name_from in p2_b and name_to in p2_a):
+                return True
+                
+            return False
+
         def extend_matrix(base_matrix):
             new_matrix = [[0] * num_nodes for _ in range(num_nodes)]
             for i in range(num_nodes):
@@ -459,7 +435,6 @@ def optimize():
                     if not vehicle_free[vehicle_id]:
                         routing.VehicleVar(node_idx).RemoveValue(vehicle_id)
 
-        # Identificación de nodos especiales ANTES de asignar modos
         prioridad_pa_tag = "PUNTO AZUL"
         prioridad_lv_tag = "LA VEGA"
         prioridad_tottus_tag = "TOTTUS CD"
@@ -472,12 +447,10 @@ def optimize():
             is_lv_node.append(prioridad_lv_tag in ident)
             is_tottus_node.append(prioridad_tottus_tag in ident)
             is_unimarc_node.append(prioridad_unimarc_tag in ident)
-            # Doble ventana horaria Jue/Vie/Sáb: detectar por nombre (acepta tildes y variantes)
             is_nicolas_palma_node.append(
                 "NICOLAS PALMA" in ident or "NICOLÁS PALMA" in ident
             )
 
-        # MODIFICACIÓN: Permitir LA VEGA en rutas CENCOSUD
         MODE_FREE, MODE_W, MODE_C = 0, 1, 2
         for node_index in range(1, num_nodes):
             g = node_group[node_index]
@@ -487,7 +460,6 @@ def optimize():
             elif g == "CENCOSUD":
                 allowed = {MODE_C}
             else:
-                # LA VEGA puede ir en rutas MODE_C (CENCOSUD) además de MODE_FREE
                 if is_lv_node[node_index]:
                     allowed = {MODE_FREE, MODE_C}
                 else:
@@ -496,49 +468,31 @@ def optimize():
                 if vehicle_mode[v] not in allowed:
                     routing.VehicleVar(node_idx).RemoveValue(v)
         
-        # NUEVA RESTRICCIÓN: Si una ruta CENCOSUD incluye LA VEGA, debe ser la primera parada
-        # Se implementa como PENALIZACIÓN SUAVE por defecto (más robusto)
-        # Para activar restricción dura: enforce_lv_first_hard=true en el request
         solver = routing.solver()
         
-        # Flag para activar/desactivar la restricción dura (desactivado por defecto)
         enforce_lv_first_hard = data.get("enforce_lv_first_hard", False)
         
         if enforce_lv_first_hard:
-            # ADVERTENCIA: Esta restricción dura puede causar infactibilidad
-            # Solo usarla cuando estés seguro de que la ruta es factible
             for v in range(num_vehicles):
-                if vehicle_mode[v] == MODE_C:  # Solo para vehículos en modo CENCOSUD
+                if vehicle_mode[v] == MODE_C: 
                     start_idx = routing.Start(v)
-                    
-                    # Encontrar índices de LA VEGA y nodos CENCOSUD
                     lv_indices = [manager.NodeToIndex(i) for i in range(1, num_nodes) if is_lv_node[i]]
                     cencosud_indices = [manager.NodeToIndex(i) for i in range(1, num_nodes) 
                                        if node_group[i] == "CENCOSUD"]
                     
-                    # Para cada nodo LA VEGA
                     for lv_idx in lv_indices:
                         lv_node = manager.IndexToNode(lv_idx)
-                        
-                        # Para cada nodo CENCOSUD (que no sea LA VEGA)
                         for cenc_idx in cencosud_indices:
                             cenc_node = manager.IndexToNode(cenc_idx)
                             if cenc_node == lv_node:
                                 continue
                             
-                            # Si ambos están en la misma ruta de este vehículo MODE_C,
-                            # entonces LA VEGA debe venir directamente del start
                             lv_active = routing.ActiveVar(lv_idx)
                             cenc_active = routing.ActiveVar(cenc_idx)
-                            
-                            # Si ambos activos => LA VEGA es next(start)
-                            # Usamos: lv_active + cenc_active <= 1 + lv_is_first
-                            # Equivale a: (lv_active AND cenc_active) => lv_is_first
                             lv_next_var = routing.NextVar(start_idx)
                             solver.Add((lv_active + cenc_active - 1) <= 
                                      solver.IsEqualCstVar(lv_next_var, lv_idx))
 
-        # Continuación del código original...
         any_pa_exists = any(is_pa_node[1:])
         any_lv_exists = any(is_lv_node[1:])
         any_tier3_exists = any(
@@ -610,11 +564,8 @@ def optimize():
                             if is_tier3(from_node) and is_lv_node[to_node]:
                                 base += LV_AFTER_TIER3_EXTRA_PENALTY
 
-                    # MODIFICACIÓN: No penalizar mezcla LA VEGA + CENCOSUD
                     if from_node != depot and to_node != depot:
                         g_from, g_to = node_group[from_node], node_group[to_node]
-                        
-                        # EXCEPCIÓN: LA VEGA puede mezclarse con CENCOSUD
                         is_lv_exception = (
                             (is_lv_node[from_node] and g_to == "CENCOSUD") or
                             (g_from == "CENCOSUD" and is_lv_node[to_node])
@@ -624,12 +575,10 @@ def optimize():
                             if g_from != g_to and ("WALMART" in (g_from, g_to) or "CENCOSUD" in (g_from, g_to)):
                                 base += HIGH_PENALTY
                     
-                    # PENALIZACIÓN SUAVE: Si en modo CENCOSUD, penalizar ir a LA VEGA después de otro nodo CENCOSUD
                     if vehicle_mode[v_idx] == MODE_C:
                         if to_node != depot and is_lv_node[to_node]:
                             if from_node != depot and node_group[from_node] == "CENCOSUD":
-                                # LA VEGA viene después de un nodo CENCOSUD (no es primera)
-                                base += 50_000  # Penalización moderada
+                                base += 50_000 
                     
                     return base
                 return distance
@@ -659,6 +608,9 @@ def optimize():
 
         start_indices = set(routing.Start(v) for v in range(num_vehicles))
 
+        # -------------------------------------------------------------------------
+        # CALLBACK DE TIEMPO (Ahora el servicio se gestiona en el SlackVar)
+        # -------------------------------------------------------------------------
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node   = manager.IndexToNode(to_index)
@@ -666,35 +618,41 @@ def optimize():
             service = 0
             if from_node == depot and from_index not in start_indices:
                 service += reload_service_time 
-            if from_node != depot:
-                service += int(round(extended_wait[from_node]))
+            # El tiempo de espera se maneja ahora dinámicamente con SlackVar
             return travel + service
 
         time_cb = routing.RegisterTransitCallback(time_callback)
 
-        # -----------------------------------------------------------------------
-        # SLACK de espera en nodos:
-        # Con slack=0 OR-Tools NO puede modelar espera (el CumulVar es estrictamente
-        # la suma de tránsitos acumulados). Esto hacía infactible cualquier ruta con
-        # salida temprana (ej: 01:00 AM) y aperturas tardías (ej: 08:00 AM).
-        #
-        # El slack se calcula como la apertura más tardía relativa al reference_departure
-        # + un buffer de 120 min, garantizando que el solver siempre pueda modelar
-        # "el camión llega temprano y espera hasta que abra".
-        #
-        # IMPORTANTE: la espera NO cuenta como tiempo de manejo — la dimensión Drive
-        # usa drive_callback (solo viaje) sin slack, así que Drive sigue siendo puro.
-        # -----------------------------------------------------------------------
-        _max_opening_rel = max(
-            (int(v) for v in extended_opening[1:] if v is not None),
-            default=0
-        )
-        slack_tiempo_espera = max(_max_opening_rel + 120, 120)
-        print(f"⏳ Slack de espera habilitado: {slack_tiempo_espera} min "
-              f"(apertura más tardía: {_max_opening_rel} min desde salida referencia)")
+        # -------------------------------------------------------------------------
+        # DIMENSIÓN DE TIEMPO CON SLACK DINÁMICO
+        # -------------------------------------------------------------------------
+        _max_opening_rel = max((int(v) for v in extended_opening[1:] if v is not None), default=0)
+        max_wait_val = max((int(round(w)) for w in extended_wait[1:]), default=0)
+        
+        slack_tiempo_espera = max(_max_opening_rel + 120, 120) + max_wait_val
+        print(f"⏳ Slack de espera habilitado: {slack_tiempo_espera} min")
 
         routing.AddDimension(time_cb, slack_tiempo_espera, 10**7, False, "Time")
         time_dimension = routing.GetDimensionOrDie("Time")
+
+        for node in range(1, num_nodes):
+            idx = manager.NodeToIndex(node)
+            w_here = int(round(extended_wait[node]))
+            if w_here > 0:
+                pair_prev_indices = []
+                for prev_node in range(1, num_nodes):
+                    if is_shared_warehouse_pair(prev_node, node):
+                        pair_prev_indices.append(manager.NodeToIndex(prev_node))
+                
+                if pair_prev_indices:
+                    is_preceded_expr = solver.Sum([
+                        solver.IsEqualCstVar(routing.NextVar(p_idx), idx) 
+                        for p_idx in pair_prev_indices
+                    ])
+                    is_active = routing.ActiveVar(idx)
+                    solver.Add(time_dimension.SlackVar(idx) >= w_here * (is_active - is_preceded_expr))
+                else:
+                    solver.Add(time_dimension.SlackVar(idx) >= w_here * routing.ActiveVar(idx))
 
         vehicle_start_offsets = {}
         if reference_departure_minutes is not None:
@@ -707,46 +665,23 @@ def optimize():
                     offset = dep_abs - reference_departure_minutes
                     if offset < 0:
                         offset += 24 * 60
-                    # Si el offset supera 12 horas, el camión probablemente salió el día
-                    # ANTERIOR a la referencia (ej: referencia=01:00, camión=23:00 → offset
-                    # calculado en bruto=1320 min, pero en realidad salió 2h ANTES → -120).
-                    # Restando 24h obtenemos el offset real negativo, y OR-Tools lo interpreta
-                    # correctamente gracias al slack de la dimensión Time.
                     elif offset > 12 * 60:
                         offset -= 24 * 60
                         print(f"🌙 Offset cross-midnight corregido para vehículo base {base_idx}: "
                               f"{offset + 24*60} min → {offset} min "
                               f"({_fmt_hhmm(dep_abs)} salió antes que referencia {_fmt_hhmm(reference_departure_minutes)})")
                 start_idx = routing.Start(v)
-                # Si el offset es negativo (salida antes de la referencia), el camión
-                # ya lleva |offset| minutos en ruta cuando empieza el marco de referencia.
-                # CumulVar no puede ser negativo, así que lo fijamos en 0 y las
-                # ventanas horarias de los nodos se ajustan naturalmente vía slack.
                 effective_start = max(0, offset)
                 time_dimension.CumulVar(start_idx).SetRange(effective_start, effective_start)
-                vehicle_start_offsets[v] = offset  # guardamos el offset real (puede ser negativo)
+                vehicle_start_offsets[v] = offset 
         else:
             for v in range(num_vehicles):
                 start_idx = routing.Start(v)
                 time_dimension.CumulVar(start_idx).SetRange(0, 0)
                 vehicle_start_offsets[v] = 0
 
-        # ============================================================================
-        # VENTANAS HORARIAS — llegada temprana permitida + doble ventana (Nicolas Palma)
-        #
-        # Para nodos normales: comportamiento original (sin lower bound en llegada,
-        #   solo deadline como upper bound y constraint de apertura en salida).
-        #
-        # Para "NICOLAS PALMA" en Jue/Vie/Sáb: se agrega una SEGUNDA ventana fija
-        #   20:00–23:59, usando la técnica OR de OR-Tools:
-        #     Max(w1_ub - arrival, arrival - sv_open) >= 0
-        #   → el camión debe llegar ANTES del cierre de ventana 1
-        #     O DESPUÉS de las 20:00 (ventana 2).
-        # ============================================================================
-
-        # Constantes de la segunda ventana (fijas en código, minutos desde medianoche)
-        NP_SV_OPEN_ABS  = 20 * 60        # 20:00 → 1200 min
-        NP_SV_CLOSE_ABS = 23 * 60 + 59   # 23:59 → 1439 min
+        NP_SV_OPEN_ABS  = 20 * 60        
+        NP_SV_CLOSE_ABS = 23 * 60 + 59   
 
         if reference_departure_minutes is not None:
             for node in range(1, num_nodes):
@@ -758,27 +693,15 @@ def optimize():
                 use_double_window = is_nicolas_palma_node[node] and es_dia_segunda_ventana_np
 
                 if use_double_window:
-                    # ------------------------------------------------------------------
-                    # DOBLE VENTANA — Nicolas Palma — Jue / Vie / Sáb
-                    #
-                    # Ventana 1 (del JSON): apertura normal → cierre normal
-                    # Ventana 2 (hardcoded): 20:00 → 23:59
-                    #
-                    # El camión DEBE caer en una de las dos ventanas.
-                    # Si no hay ventana 1 en el JSON, se usa solo ventana 2.
-                    # ------------------------------------------------------------------
                     arrival_var = time_dimension.CumulVar(idx)
 
-                    # Ventana 2 en minutos relativos al reference_departure
                     sv_open_rel  = NP_SV_OPEN_ABS  - reference_departure_minutes
                     sv_close_rel = NP_SV_CLOSE_ABS - reference_departure_minutes
-                    # Corrección por salto de día (ej: salida 22:00, ventana 20:00 = "mañana")
                     if sv_open_rel  < -12 * 60: sv_open_rel  += 24 * 60
                     if sv_close_rel < -12 * 60: sv_close_rel += 24 * 60
 
-                    # Leer límites de ventana 1 del JSON (pueden ser None si no vienen)
-                    w1_ub        = None   # upper bound de llegada (deadline del JSON)
-                    w1_open_real = None   # apertura real de la tienda (del JSON)
+                    w1_ub        = None   
+                    w1_open_real = None   
 
                     if extended_deadline[node] is not None:
                         cl_gap = max(0, int(extended_closing_gap[node] or 0))
@@ -788,26 +711,14 @@ def optimize():
                         w1_open_real = int(extended_opening[node])
 
                     if w1_ub is not None:
-                        # Hay ventana 1 → aplicar OR(ventana1, ventana2)
-
-                        # Upper bound global: el más tardío de ambas ventanas
                         overall_ub = max(w1_ub, sv_close_rel)
                         arrival_var.SetRange(0, overall_ub)
 
-                        # Restricción OR de intervalos (ventanas no solapadas):
-                        #   Max(w1_ub - arrival, arrival - sv_open_rel) >= 0
-                        #   → arrival <= w1_ub   O   arrival >= sv_open_rel
                         if w1_ub < sv_open_rel:
                             solver.Add(
                                 solver.Max(w1_ub - arrival_var, arrival_var - sv_open_rel) >= 0
                             )
-                        # Si w1_ub >= sv_open_rel las ventanas se solapan → basta SetRange
 
-                        # Restricción de apertura — versión OR:
-                        #   En ventana 1: arrival + wait >= w1_open_real
-                        #   En ventana 2: arrival >= sv_open_rel - wait  (llega antes y espera)
-                        #   Combinado: Max(arrival + wait - w1_open_real,
-                        #                  arrival - max(0, sv_open_rel - wait)) >= 0
                         if w1_open_real is not None:
                             sv_earliest = max(0, sv_open_rel - wait_here)
                             solver.Add(
@@ -822,7 +733,6 @@ def optimize():
                         v1_close_str = _fmt_hhmm((reference_departure_minutes + w1_ub) % (24 * 60))
 
                     else:
-                        # No hay ventana 1 → solo aplicar ventana 2 como único límite
                         arrival_var.SetRange(0, sv_close_rel)
                         v1_open_str  = "—"
                         v1_close_str = "sin cierre"
@@ -836,11 +746,6 @@ def optimize():
                     print(f"   Ventana 2 (fija):   {sv_open_clock} → {sv_close_clock}")
 
                 else:
-                    # ------------------------------------------------------------------
-                    # VENTANA SIMPLE — comportamiento original sin cambios
-                    # ------------------------------------------------------------------
-
-                    # 1. DEADLINE (upper bound): No puede llegar DESPUÉS de este tiempo
                     if extended_deadline[node] is not None:
                         cl_gap = int(extended_closing_gap[node]) if extended_closing_gap[node] is not None else 0
                         if cl_gap < 0:
@@ -855,7 +760,6 @@ def optimize():
                         print(f"📅 {loc_name} (ID {loc_id}): debe llegar antes de {deadline_clock} "
                               f"(deadline={eff_deadline} min desde salida, gap={cl_gap} min)")
 
-                    # 2. APERTURA REAL: No puede SALIR antes de que la tienda abra
                     if extended_opening[node] is not None:
                         opening_real = int(extended_opening[node])
 
@@ -870,8 +774,6 @@ def optimize():
                         print(f"   ✓ Puede llegar desde las {earliest_arrival_clock} (gap={op_gap} min)")
                         print(f"   ✓ No puede salir antes de {opening_clock} (apertura real)")
                         print(f"   ✓ Tiempo de espera/descarga: {wait_here} min")
-
-        # ============================================================================
 
         def drive_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
@@ -892,9 +794,17 @@ def optimize():
             ]
             solver.Add(solver.Sum(end_cumuls) <= HORIZON)
 
+        # -------------------------------------------------------------------------
+        # CALLBACK DE PARADAS (Omite el límite para nodos emparejados)
+        # -------------------------------------------------------------------------
         def stop_callback(from_index, to_index):
+            from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
-            return 1 if to_node != depot else 0
+            if to_node == depot: 
+                return 0
+            if is_shared_warehouse_pair(from_node, to_node):
+                return 0  
+            return 1
 
         stop_cb = routing.RegisterTransitCallback(stop_callback)
         routing.AddDimension(stop_cb, 0, maximo_de_paradas, True, "Stops")
@@ -935,7 +845,6 @@ def optimize():
         _safe_set(search_parameters, "number_of_workers", req_workers)
         _safe_set(search_parameters, "log_search", bool(data.get("log_search", False)))
 
-        # --- NUEVO: Monitor de soluciones intermedias ---
         class RoutingMonitor:
             def __init__(self, routing_model, current_job_id):
                 self.routing = routing_model
@@ -950,7 +859,6 @@ def optimize():
 
         monitor = RoutingMonitor(routing, job_id)
         routing.AddAtSolutionCallback(monitor)
-        # -------------------------------------------------
 
         solution = routing.SolveWithParameters(search_parameters)
         if not solution:
@@ -1028,7 +936,16 @@ def optimize():
                     time_cumul = cumul(time_dimension, idx)     
                     drive_cumul = cumul(drive_dimension, idx)   
                     stops_cumul = cumul(stops_dimension, idx)
-                    wait_here = int(round(extended_wait[node]))
+                    
+                    # -----------------------------------------------------------------
+                    # APLICAR LECTURA DE ESPERA DE BODEGA COMPARTIDA EN LA EXTRACCIÓN
+                    # -----------------------------------------------------------------
+                    prev_node_in_route = route_nodes[-2] if len(route_nodes) > 1 else depot
+                    if is_shared_warehouse_pair(prev_node_in_route, node):
+                        wait_here = 0
+                    else:
+                        wait_here = int(round(extended_wait[node]))
+                        
                     op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
                     cl_gap = int(extended_closing_gap[node]) if extended_closing_gap[node] is not None else 0
                     if op_gap < 0: op_gap = 0
@@ -1042,10 +959,6 @@ def optimize():
                     if departure_from_departure < 0:
                         departure_from_departure = 0
 
-                    # Tiempo de espera real en el nodo (llegó antes de la apertura).
-                    # Fórmula: apertura_rel - time_cumul (ambos en frame de reference_departure).
-                    # Si el camión llegó DESPUÉS de la apertura → 0.
-                    # No se suma al Drive (la dimensión Drive es solo viaje).
                     if extended_opening[node] is not None:
                         waiting_at_node_minutes = max(0, int(extended_opening[node]) - int(time_cumul))
                     else:
@@ -1058,14 +971,12 @@ def optimize():
                     deadline_from_departure = None
 
                     if deadline_rel is not None:
-                        # El deadline ahora es la hora límite de LLEGADA (no de salida)
                         eff_deadline = int(deadline_rel) - cl_gap
-                        deadline_ub_eff = max(0, eff_deadline)  # Ya no restamos wait_time
+                        deadline_ub_eff = max(0, eff_deadline) 
                         deadline_from_departure = eff_deadline - start_offset
                         latest_arrival_from_departure = deadline_ub_eff - start_offset
 
                         if latest_arrival_from_departure is not None:
-                            # Slack = cuánto tiempo tiene de margen antes del cierre
                             deadline_slack = latest_arrival_from_departure - arrival_from_departure
 
                     truck_departure_abs = (

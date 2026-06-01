@@ -382,22 +382,31 @@ def optimize():
         node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
 
         # -------------------------------------------------------------------------
-        # FUNCIÓN DE PARES DE BODEGA COMPARTIDA
+        # FUNCIÓN DE PARES DE BODEGA COMPARTIDA (TIPO "LIKE")
         # -------------------------------------------------------------------------
         def is_shared_warehouse_pair(from_node, to_node):
             if from_node == depot or to_node == depot:
                 return False
             
-            name_from = (extended_locations[from_node].get("identificador") or "").strip().upper()
-            name_to   = (extended_locations[to_node].get("identificador") or "").strip().upper()
+            name_from = (extended_locations[from_node].get("identificador") or "").upper()
+            name_to   = (extended_locations[to_node].get("identificador") or "").upper()
             
-            p1 = {"JUMBO DARK STORE COSTANERA", "JUMBO COSTANERA"}
-            if name_from in p1 and name_to in p1 and name_from != name_to:
+            def is_jumbo_costanera(name):
+                return "JUMBO" in name and "COSTANERA" in name and "DARK" not in name
+            def is_dark_costanera(name):
+                return "JUMBO" in name and "COSTANERA" in name and "DARK" in name
+                
+            def is_jumbo_vina(name):
+                return "JUMBO" in name and "1 NORTE" in name and ("VIÑA" in name or "VINA" in name)
+            def is_dark_vina(name):
+                return "JUMBO" in name and "DARK" in name and ("VIÑA" in name or "VINA" in name)
+            
+            if (is_jumbo_costanera(name_from) and is_dark_costanera(name_to)) or \
+               (is_dark_costanera(name_from) and is_jumbo_costanera(name_to)):
                 return True
-            
-            p2_a = {"JUMBO 1 NORTE VIÑA DEL MAR", "JUMBO 1 NORTE VINA DEL MAR"}
-            p2_b = {"JUMBO DARK STORE VIÑA DEL MAR", "JUMBO DARK STORE VINA DEL MAR"}
-            if (name_from in p2_a and name_to in p2_b) or (name_from in p2_b and name_to in p2_a):
+                
+            if (is_jumbo_vina(name_from) and is_dark_vina(name_to)) or \
+               (is_dark_vina(name_from) and is_jumbo_vina(name_to)):
                 return True
                 
             return False
@@ -618,7 +627,6 @@ def optimize():
             service = 0
             if from_node == depot and from_index not in start_indices:
                 service += reload_service_time 
-            # El tiempo de espera se maneja ahora dinámicamente con SlackVar
             return travel + service
 
         time_cb = routing.RegisterTransitCallback(time_callback)
@@ -941,7 +949,9 @@ def optimize():
                     # APLICAR LECTURA DE ESPERA DE BODEGA COMPARTIDA EN LA EXTRACCIÓN
                     # -----------------------------------------------------------------
                     prev_node_in_route = route_nodes[-2] if len(route_nodes) > 1 else depot
-                    if is_shared_warehouse_pair(prev_node_in_route, node):
+                    is_shared_pair = is_shared_warehouse_pair(prev_node_in_route, node)
+                    
+                    if is_shared_pair:
                         wait_here = 0
                     else:
                         wait_here = int(round(extended_wait[node]))
@@ -959,7 +969,7 @@ def optimize():
                     if departure_from_departure < 0:
                         departure_from_departure = 0
 
-                    if extended_opening[node] is not None:
+                    if extended_opening[node] is not None and not is_shared_pair:
                         waiting_at_node_minutes = max(0, int(extended_opening[node]) - int(time_cumul))
                     else:
                         waiting_at_node_minutes = 0
@@ -1024,6 +1034,7 @@ def optimize():
                         "node_index": node,
                         "group": node_group[node],
                         "requires_refrigeration": bool(extended_refrigerate[node]),
+                        "shared_warehouse_wait_waived": is_shared_pair,
                         "products": demanda,
                         "products_detail": products_detail,
                         "totals": {

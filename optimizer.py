@@ -388,8 +388,6 @@ def optimize():
             if from_node == depot or to_node == depot:
                 return False
             
-            # Extraemos los IDs de manera segura y los convertimos a string 
-            # para evitar problemas si vienen como integer (ej. 6 vs "6")
             loc_from = extended_locations[from_node]
             id_from = str(loc_from.get("id") or loc_from.get("location_id") or "")
             
@@ -613,7 +611,7 @@ def optimize():
         start_indices = set(routing.Start(v) for v in range(num_vehicles))
 
         # -------------------------------------------------------------------------
-        # CALLBACK DE TIEMPO (Ahora el servicio se gestiona en el SlackVar)
+        # CALLBACK DE TIEMPO
         # -------------------------------------------------------------------------
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
@@ -622,7 +620,6 @@ def optimize():
             service = 0
             if from_node == depot and from_index not in start_indices:
                 service += reload_service_time 
-            # El tiempo de espera se maneja ahora dinámicamente con SlackVar
             return travel + service
 
         time_cb = routing.RegisterTransitCallback(time_callback)
@@ -671,17 +668,17 @@ def optimize():
                         offset += 24 * 60
                     elif offset > 12 * 60:
                         offset -= 24 * 60
-                        print(f"🌙 Offset cross-midnight corregido para vehículo base {base_idx}: "
-                              f"{offset + 24*60} min → {offset} min "
-                              f"({_fmt_hhmm(dep_abs)} salió antes que referencia {_fmt_hhmm(reference_departure_minutes)})")
+                
                 start_idx = routing.Start(v)
                 effective_start = max(0, offset)
-                time_dimension.CumulVar(start_idx).SetRange(effective_start, effective_start)
+                
+                # Permitir al solver retrasar la salida hasta 24h para encontrar la hora óptima
+                time_dimension.CumulVar(start_idx).SetRange(effective_start, effective_start + 24 * 60)
                 vehicle_start_offsets[v] = offset 
         else:
             for v in range(num_vehicles):
                 start_idx = routing.Start(v)
-                time_dimension.CumulVar(start_idx).SetRange(0, 0)
+                time_dimension.CumulVar(start_idx).SetRange(0, 24 * 60)
                 vehicle_start_offsets[v] = 0
 
         NP_SV_OPEN_ABS  = 20 * 60        
@@ -816,6 +813,7 @@ def optimize():
         for v in range(num_vehicles):
             stops_dimension.CumulVar(routing.End(v)).SetMax(maximo_de_paradas)
 
+        # Configurar el solver para que busque activamente MINIMIZAR el tiempo total
         time_dimension.SetGlobalSpanCostCoefficient(50)
 
         costo_varias_rutas = True
@@ -891,7 +889,18 @@ def optimize():
             main_vehicle = vehicle_mapping[v]
             trip_no = vehicle_trip_no[v]
             mode = vehicle_mode[v]
-            start_offset = int(vehicle_start_offsets.get(v, 0))
+            
+            # --- CÁLCULO DE HORA ÓPTIMA DE SALIDA Y MARGEN ---
+            original_start_offset = int(vehicle_start_offsets.get(v, 0))
+            optimized_start_offset = int(cumul(time_dimension, start))
+            
+            # Aplicar margen de 30 minutos sin retroceder antes de la hora original solicitada
+            buffered_start_offset = max(original_start_offset, optimized_start_offset - 30)
+            
+            # Sobrescribimos el start_offset para que toda la ruta se construya asumiendo la salida óptima
+            start_offset = buffered_start_offset
+            
+            delay_minutes = optimized_start_offset - original_start_offset
 
             route_nodes = []
             deliveries = []
@@ -945,7 +954,9 @@ def optimize():
                     # APLICAR LECTURA DE ESPERA DE BODEGA COMPARTIDA EN LA EXTRACCIÓN
                     # -----------------------------------------------------------------
                     prev_node_in_route = route_nodes[-2] if len(route_nodes) > 1 else depot
-                    if is_shared_warehouse_pair(prev_node_in_route, node):
+                    is_shared_pair = is_shared_warehouse_pair(prev_node_in_route, node)
+                    
+                    if is_shared_pair:
                         wait_here = 0
                     else:
                         wait_here = int(round(extended_wait[node]))
@@ -963,7 +974,7 @@ def optimize():
                     if departure_from_departure < 0:
                         departure_from_departure = 0
 
-                    if extended_opening[node] is not None:
+                    if extended_opening[node] is not None and not is_shared_pair:
                         waiting_at_node_minutes = max(0, int(extended_opening[node]) - int(time_cumul))
                     else:
                         waiting_at_node_minutes = 0
@@ -1028,6 +1039,7 @@ def optimize():
                         "node_index": node,
                         "group": node_group[node],
                         "requires_refrigeration": bool(extended_refrigerate[node]),
+                        "shared_warehouse_wait_waived": is_shared_pair,
                         "products": demanda,
                         "products_detail": products_detail,
                         "totals": {
@@ -1113,24 +1125,35 @@ def optimize():
                 if not (n == 0 and cleaned_route[-1] == 0):
                     cleaned_route.append(n)
 
-            dep_abs_v = (
+            # CÁLCULOS DE RELOJES PARA EL JSON
+            original_dep_abs_v = (
+                (reference_departure_minutes + original_start_offset)
+                if reference_departure_minutes is not None else None
+            )
+            requested_departure_clock_v = _fmt_hhmm(original_dep_abs_v) if original_dep_abs_v is not None else None
+
+            optimal_dep_abs_v = (
                 (reference_departure_minutes + start_offset)
                 if reference_departure_minutes is not None else None
             )
-            departure_clock_v = _fmt_hhmm(dep_abs_v) if dep_abs_v is not None else None
+            optimal_departure_clock_v = _fmt_hhmm(optimal_dep_abs_v) if optimal_dep_abs_v is not None else None
 
             return_minutes_from_departure = int(time_total) - start_offset
             if return_minutes_from_departure < 0:
                 return_minutes_from_departure = 0
+                
             return_clock_v = (
-                _fmt_hhmm(dep_abs_v + return_minutes_from_departure)
-                if dep_abs_v is not None else None
+                _fmt_hhmm(optimal_dep_abs_v + return_minutes_from_departure)
+                if optimal_dep_abs_v is not None else None
             )
             trip_duration_minutes = return_minutes_from_departure
 
             agg = vehicle_trips.setdefault(main_vehicle, {
                 "vehicle": main_vehicle,
-                "departure_clock": departure_clock_v,   
+                "requested_departure_clock": requested_departure_clock_v,
+                "optimal_departure_clock": optimal_departure_clock_v,
+                "departure_delay_minutes": delay_minutes,
+                "departure_clock": optimal_departure_clock_v,   
                 "trips": [],
                 "total_distance": 0.0,
                 "total_fuel_liters": 0.0,
@@ -1154,9 +1177,14 @@ def optimize():
                 "route": cleaned_route,
                 "deliveries": deliveries,
                 "num_stops": int(stops_count),
-                "departure_clock": departure_clock_v,      
+                
+                "requested_departure_clock": requested_departure_clock_v,
+                "optimal_departure_clock": optimal_departure_clock_v,
+                "departure_delay_minutes": delay_minutes,
+                "departure_clock": optimal_departure_clock_v,      
                 "return_clock": return_clock_v,            
                 "duration_minutes": trip_duration_minutes, 
+                
                 "time_minutes_total": duration_end,        
                 "time_minutes_drive": int(time_drive),     
                 "distance": float(dist_v),

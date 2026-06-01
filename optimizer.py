@@ -382,22 +382,26 @@ def optimize():
         node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
 
         # -------------------------------------------------------------------------
-        # FUNCIÓN DE PARES DE BODEGA COMPARTIDA
+        # FUNCIÓN DE PARES DE BODEGA COMPARTIDA (POR ID)
         # -------------------------------------------------------------------------
         def is_shared_warehouse_pair(from_node, to_node):
             if from_node == depot or to_node == depot:
                 return False
             
-            name_from = (extended_locations[from_node].get("identificador") or "").strip().upper()
-            name_to   = (extended_locations[to_node].get("identificador") or "").strip().upper()
+            # Extraemos los IDs de manera segura y los convertimos a string 
+            # para evitar problemas si vienen como integer (ej. 6 vs "6")
+            loc_from = extended_locations[from_node]
+            id_from = str(loc_from.get("id") or loc_from.get("location_id") or "")
             
-            p1 = {"JUMBO DARK STORE COSTANERA", "JUMBO COSTANERA"}
-            if name_from in p1 and name_to in p1 and name_from != name_to:
+            loc_to = extended_locations[to_node]
+            id_to = str(loc_to.get("id") or loc_to.get("location_id") or "")
+            
+            # Par 1: Jumbo Costanera + Dark Store (IDs 6 y 232)
+            if (id_from == "6" and id_to == "232") or (id_from == "232" and id_to == "6"):
                 return True
-            
-            p2_a = {"JUMBO 1 NORTE VIÑA DEL MAR", "JUMBO 1 NORTE VINA DEL MAR"}
-            p2_b = {"JUMBO DARK STORE VIÑA DEL MAR", "JUMBO DARK STORE VINA DEL MAR"}
-            if (name_from in p2_a and name_to in p2_b) or (name_from in p2_b and name_to in p2_a):
+                
+            # Par 2: Jumbo 1 Norte + Dark Store (IDs 115 y 116)
+            if (id_from == "115" and id_to == "116") or (id_from == "116" and id_to == "115"):
                 return True
                 
             return False

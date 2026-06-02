@@ -716,7 +716,12 @@ def optimize():
                               f"({_fmt_hhmm(dep_abs)} salió antes que referencia {_fmt_hhmm(reference_departure_minutes)})")
                 start_idx = routing.Start(v)
                 effective_start = max(0, offset)
-                time_dimension.CumulVar(start_idx).SetRange(effective_start, effective_start)
+                MAX_DEPARTURE_SLACK = 720  # 12h máximo de retraso posible
+
+                time_dimension.CumulVar(start_idx).SetRange(
+                    effective_start,
+                    effective_start + MAX_DEPARTURE_SLACK
+                )
                 vehicle_start_offsets[v] = offset 
         else:
             for v in range(num_vehicles):
@@ -931,7 +936,13 @@ def optimize():
             main_vehicle = vehicle_mapping[v]
             trip_no = vehicle_trip_no[v]
             mode = vehicle_mode[v]
-            start_offset = int(vehicle_start_offsets.get(v, 0))
+            actual_start = solution.Value(time_dimension.CumulVar(routing.Start(v)))
+            start_offset = actual_start  # en vez del offset calculado del input
+
+            # La hora de salida real del camión:
+            if reference_departure_minutes is not None:
+                actual_departure_abs = reference_departure_minutes + actual_start
+                departure_clock_v = _fmt_hhmm(actual_departure_abs)
 
             route_nodes = []
             deliveries = []

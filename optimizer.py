@@ -480,7 +480,7 @@ def optimize():
                     routing.VehicleVar(node_idx).RemoveValue(v)
         
         solver = routing.solver()
-        
+
         # ── Un camión físico solo puede activar UN modo virtual por trip ──
         for base in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
@@ -488,11 +488,19 @@ def optimize():
                     v for v in range(num_vehicles)
                     if vehicle_mapping[v] == base and vehicle_trip_no[v] == trip
                 ]
-                is_used_list = [
-                    solver.IsNotEqualCstVar(routing.NextVar(routing.Start(v)), routing.End(v))
-                    for v in trip_vs
-                ]
-                solver.Add(solver.Sum(is_used_list) <= 1)
+                n = len(trip_vs)
+                if n > 1:
+                    # is_empty[v] = 1 si el vehículo virtual no tiene ruta (next_start == end)
+                    is_empty_list = [
+                        solver.IsEqualCstVar(
+                            routing.NextVar(routing.Start(v)), routing.End(v)
+                        )
+                        for v in trip_vs
+                    ]
+                    # "a lo sumo 1 activo" ≡ "al menos N-1 vacíos"
+                    solver.Add(solver.Sum(is_empty_list) >= n - 1)
+        
+        
         
         enforce_lv_first_hard = data.get("enforce_lv_first_hard", False)
         

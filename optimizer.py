@@ -21,7 +21,6 @@ if redis_url:
             redis_client = redis.from_url(redis_url, ssl_cert_reqs=ssl.CERT_NONE)
         else:
             redis_client = redis.from_url(redis_url)
-        
         redis_client.ping()
         print("✅ Conectado a Redis exitosamente.")
     except Exception as e:
@@ -31,7 +30,6 @@ else:
     print("⚠️ ADVERTENCIA: Variable REDIS_URL no configurada.")
 
 def update_job_status(job_id: str, status: str, message: str, progress: int):
-    """Guarda el progreso en Redis. Falla silenciosamente para no quebrar el optimizador."""
     if not job_id or not redis_client:
         return
     try:
@@ -50,26 +48,22 @@ def update_job_status(job_id: str, status: str, message: str, progress: int):
 # ---------------------------------------------------------------------
 
 def _safe_set(obj, attr, value):
-    """Setea un atributo protobuf si existe; si no, lo ignora sin romper."""
     try:
         setattr(obj, attr, value)
     except Exception:
         pass
 
 def _parse_departure_minutes(hhmm: str) -> int:
-    """Convierte 'HH:MM' a minutos desde 00:00."""
     hh, mm = hhmm.split(":")
     return int(hh) * 60 + int(mm)
 
 def _fmt_hhmm(total_minutes: int) -> str:
-    """Formatea minutos (mod 24h) a 'HH:MM'."""
     total_minutes %= (24 * 60)
     hh = total_minutes // 60
     mm = total_minutes % 60
     return f"{hh:02d}:{mm:02d}"
 
 def _add_minutes_to_clock(clock_str: str, minutes) -> str:
-    """Agrega minutos a un string 'HH:MM'."""
     if not clock_str or ":" not in str(clock_str):
         return clock_str
     try:
@@ -87,15 +81,13 @@ def _add_minutes_to_clock(clock_str: str, minutes) -> str:
 @app.route("/optimize", methods=["POST"])
 def optimize():
     job_id = None
-    
-    # ---------------------- Datos fijos de negocio ---------------------
+
     ubicaciones_refrigeradas = [
         "WALMART CD", "CENCOSUD CD", "SANTA ISABEL LOCAL", "JUMBO LOCAL",
         "TOTTUS CD", "TOTTUS LOCAL", "UNIMARC CD", "UNIMARC LOCAL",
         "ARAMARK", "SODEXO"
     ]
 
-    # ------------------------- Parse de entrada ------------------------
     try:
         raw_data = request.get_json()
         if raw_data is None:
@@ -123,9 +115,9 @@ def optimize():
                 _dia_semana = datetime.now().weekday()
         else:
             _dia_semana = datetime.now().weekday()
-        
+
         _DIA_NOMBRES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
-        es_dia_segunda_ventana_np = _dia_semana in (3, 4, 5) 
+        es_dia_segunda_ventana_np = _dia_semana in (3, 4, 5)
         print(f"📆 Día detectado: {_DIA_NOMBRES[_dia_semana]} "
               f"(weekday={_dia_semana}) — "
               f"{'✅ Aplica 2da ventana Nicolas Palma' if es_dia_segunda_ventana_np else '⏭ Sin 2da ventana'}")
@@ -140,7 +132,7 @@ def optimize():
         vehicle_consume_base = data.get("vehicle_consume", [1] * base_num_vehicles)
         vehicle_free_base = data.get("vehicle_free", [0] * base_num_vehicles)
         multiplicador_tiempo = float(data.get("multiplicador_tiempo", 1.0) or 1.0)
-        
+
         if multiplicador_tiempo <= 0:
             return jsonify(error="multiplicador_tiempo debe ser > 0"), 400
 
@@ -176,7 +168,6 @@ def optimize():
                 dep_str = vehicle_departure_times_raw[idx] or None
             if not dep_str and departure_time_global_str:
                 dep_str = departure_time_global_str
-
             if dep_str:
                 try:
                     minutes = _parse_departure_minutes(dep_str)
@@ -185,17 +176,17 @@ def optimize():
                 vehicle_departure_minutes_base[idx] = minutes
                 reference_candidates.append(minutes)
 
-        # DESPUÉS
+        # Referencia: la salida más temprana del ciclo real.
+        # Si hay salidas cross-midnight (ej: 22:00 y 00:00), normalizar sumando 24h
+        # a los valores < 12h para encontrar el mínimo correcto.
         reference_departure_minutes = None
         if reference_candidates:
-            # Si hay salidas que cruzan medianoche (ej: 22:00 y 00:00 en el mismo ciclo),
-            # min() elegiría 00:00 siendo que 22:00 es la salida más temprana del ciclo real.
-            # Se normalizan los tiempos < 12h sumando 24h para resolverlo.
             if max(reference_candidates) - min(reference_candidates) > 12 * 60:
                 adjusted = [t + 24 * 60 if t < 12 * 60 else t for t in reference_candidates]
                 reference_departure_minutes = min(adjusted) % (24 * 60)
             else:
                 reference_departure_minutes = min(reference_candidates)
+
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="capacidades no coinciden con max_vehicles"), 400
         if len(vehicle_consume_base) != base_num_vehicles:
@@ -219,7 +210,7 @@ def optimize():
 
         vehicle_capacities, vehicle_consume, vehicle_free, vehicle_palets = [], [], [], []
         vehicle_mapping, vehicle_trip_no, vehicle_mode = {}, {}, {}
-        max_trips_per_vehicle = 1 
+        max_trips_per_vehicle = 1
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
@@ -238,22 +229,22 @@ def optimize():
         depot = 0
 
         update_job_status(job_id, "construyendo_modelo", "Agrupando ubicaciones y dividiendo demanda de carga...", 25)
-        
+
         all_products = set()
         for loc in locations:
             all_products.update(loc.get("demanda", {}).keys())
         all_products = sorted(all_products)
 
         extended_locations   = [locations[0]]
-        extended_demands     = [0]        
-        extended_palets      = [0.0]      
-        extended_wait        = [0.0]      
-        extended_deadline    = [None]     
-        extended_opening     = [None]     
-        extended_opening_gap = [0]        
-        extended_closing_gap = [0]        
-        extended_refrigerate = [False]    
-        split_mapping        = {}         
+        extended_demands     = [0]
+        extended_palets      = [0.0]
+        extended_wait        = [0.0]
+        extended_deadline    = [None]
+        extended_opening     = [None]
+        extended_opening_gap = [0]
+        extended_closing_gap = [0]
+        extended_refrigerate = [False]
+        split_mapping        = {}
 
         def _group(identificador: str) -> str:
             ident = (identificador or "").upper()
@@ -275,20 +266,20 @@ def optimize():
 
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
-            MAX_WAIT_MINUTES = 30
+            MAX_WAIT_MINUTES = 60
             if wait_minutes > MAX_WAIT_MINUTES:
                 wait_minutes = MAX_WAIT_MINUTES
 
             opening_gap = loc.get("opening_gap")
             closing_gap = loc.get("closing_gap")
-            
+
             if opening_gap is None or opening_gap == "":
                 opening_gap = 0
             else:
                 opening_gap = int(opening_gap)
                 if opening_gap < 0:
                     opening_gap = 0
-            
+
             if closing_gap is None or closing_gap == "":
                 closing_gap = 0
             else:
@@ -345,7 +336,7 @@ def optimize():
             if total_demand <= max_vehicle_capacity:
                 extended_locations.append(loc)
                 extended_demands.append(int(total_demand))
-                extended_palets.append(palets_total)            
+                extended_palets.append(palets_total)
                 extended_wait.append(wait_minutes)
                 extended_deadline.append(deadline_minutes_rel)
                 extended_opening.append(opening_minutes_rel)
@@ -360,7 +351,7 @@ def optimize():
                 }
                 remaining = total_demand
                 remaining_per_product = prod_quantities.copy()
-                remaining_palets = palets_total  
+                remaining_palets = palets_total
 
                 while remaining > 0:
                     amount = min(remaining, max_vehicle_capacity)
@@ -373,11 +364,11 @@ def optimize():
                             split_demand[p] = q
                             remaining_per_product[p] -= q
                         frac = amount / max(remaining, 1)
-                        palets_assigned = frac * remaining_palets   
+                        palets_assigned = frac * remaining_palets
                         palets_assigned = min(palets_assigned, remaining_palets)
                     else:
                         split_demand = remaining_per_product.copy()
-                        palets_assigned = remaining_palets            
+                        palets_assigned = remaining_palets
 
                     split_loc["demanda"] = {
                         p: str(split_demand[p]) for p in all_products if split_demand[p] > 0
@@ -385,12 +376,12 @@ def optimize():
 
                     extended_locations.append(split_loc)
                     extended_demands.append(int(sum(split_demand.values())))
-                    extended_palets.append(palets_assigned)          
+                    extended_palets.append(palets_assigned)
                     extended_wait.append(wait_minutes)
                     extended_deadline.append(deadline_minutes_rel)
                     extended_opening.append(opening_minutes_rel)
-                    extended_opening_gap.append(opening_gap)         
-                    extended_closing_gap.append(closing_gap)         
+                    extended_opening_gap.append(opening_gap)
+                    extended_closing_gap.append(closing_gap)
                     extended_refrigerate.append(requires_refrigeration)
                     split_mapping[len(extended_locations) - 1] = idx_loc
 
@@ -400,29 +391,20 @@ def optimize():
         num_nodes = len(extended_locations)
         node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
 
-        # -------------------------------------------------------------------------
-        # FUNCIÓN DE PARES DE BODEGA COMPARTIDA (POR ID)
-        # -------------------------------------------------------------------------
+        # -----------------------------------------------------------------------
+        # PARES DE BODEGA COMPARTIDA
+        # -----------------------------------------------------------------------
         def is_shared_warehouse_pair(from_node, to_node):
             if from_node == depot or to_node == depot:
                 return False
-            
-            # Extraemos los IDs de manera segura y los convertimos a string 
-            # para evitar problemas si vienen como integer (ej. 6 vs "6")
             loc_from = extended_locations[from_node]
-            id_from = str(loc_from.get("id") or loc_from.get("location_id") or "")
-            
-            loc_to = extended_locations[to_node]
-            id_to = str(loc_to.get("id") or loc_to.get("location_id") or "")
-            
-            # Par 1: Jumbo Costanera + Dark Store (IDs 6 y 232)
-            if (id_from == "6" and id_to == "232") or (id_from == "232" and id_to == "6"):
+            id_from  = str(loc_from.get("id") or loc_from.get("location_id") or "")
+            loc_to   = extended_locations[to_node]
+            id_to    = str(loc_to.get("id") or loc_to.get("location_id") or "")
+            if (id_from == "6"   and id_to == "232") or (id_from == "232" and id_to == "6"):
                 return True
-                
-            # Par 2: Jumbo 1 Norte + Dark Store (IDs 115 y 116)
             if (id_from == "115" and id_to == "116") or (id_from == "116" and id_to == "115"):
                 return True
-                
             return False
 
         def extend_matrix(base_matrix):
@@ -445,9 +427,9 @@ def optimize():
                 for row in extended_time_matrix
             ]
 
-        # ------------------------------- OR-Tools ---------------------------------
+        # ------------------------------- OR-Tools --------------------------------
         update_job_status(job_id, "construyendo_modelo", "Aplicando restricciones de tiempo y reglas de exclusividad...", 40)
-        
+
         manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot)
         routing = pywrapcp.RoutingModel(manager)
 
@@ -458,9 +440,9 @@ def optimize():
                     if not vehicle_free[vehicle_id]:
                         routing.VehicleVar(node_idx).RemoveValue(vehicle_id)
 
-        prioridad_pa_tag = "PUNTO AZUL"
-        prioridad_lv_tag = "LA VEGA"
-        prioridad_tottus_tag = "TOTTUS CD"
+        prioridad_pa_tag      = "PUNTO AZUL"
+        prioridad_lv_tag      = "LA VEGA"
+        prioridad_tottus_tag  = "TOTTUS CD"
         prioridad_unimarc_tag = "UNIMARC CD"
 
         is_pa_node, is_lv_node, is_tottus_node, is_unimarc_node, is_nicolas_palma_node = [], [], [], [], []
@@ -470,9 +452,7 @@ def optimize():
             is_lv_node.append(prioridad_lv_tag in ident)
             is_tottus_node.append(prioridad_tottus_tag in ident)
             is_unimarc_node.append(prioridad_unimarc_tag in ident)
-            is_nicolas_palma_node.append(
-                "NICOLAS PALMA" in ident or "NICOLÁS PALMA" in ident
-            )
+            is_nicolas_palma_node.append("NICOLAS PALMA" in ident or "NICOLÁS PALMA" in ident)
 
         MODE_FREE, MODE_W, MODE_C = 0, 1, 2
         for node_index in range(1, num_nodes):
@@ -483,17 +463,14 @@ def optimize():
             elif g == "CENCOSUD":
                 allowed = {MODE_C}
             else:
-                if is_lv_node[node_index]:
-                    allowed = {MODE_FREE, MODE_C}
-                else:
-                    allowed = {MODE_FREE}
+                allowed = {MODE_FREE, MODE_C} if is_lv_node[node_index] else {MODE_FREE}
             for v in range(num_vehicles):
                 if vehicle_mode[v] not in allowed:
                     routing.VehicleVar(node_idx).RemoveValue(v)
-        
+
         solver = routing.solver()
 
-        # ── Un camión físico solo puede activar UN modo virtual por trip ──
+        # Un camión físico solo activa UN modo virtual por trip
         for base in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
                 trip_vs = [
@@ -502,60 +479,49 @@ def optimize():
                 ]
                 n = len(trip_vs)
                 if n > 1:
-                    # is_empty[v] = 1 si el vehículo virtual no tiene ruta (next_start == end)
                     is_empty_list = [
-                        solver.IsEqualCstVar(
-                            routing.NextVar(routing.Start(v)), routing.End(v)
-                        )
+                        solver.IsEqualCstVar(routing.NextVar(routing.Start(v)), routing.End(v))
                         for v in trip_vs
                     ]
-                    # "a lo sumo 1 activo" ≡ "al menos N-1 vacíos"
                     solver.Add(solver.Sum(is_empty_list) >= n - 1)
-        
-        
-        
+
         enforce_lv_first_hard = data.get("enforce_lv_first_hard", False)
-        
         if enforce_lv_first_hard:
             for v in range(num_vehicles):
-                if vehicle_mode[v] == MODE_C: 
+                if vehicle_mode[v] == MODE_C:
                     start_idx = routing.Start(v)
                     lv_indices = [manager.NodeToIndex(i) for i in range(1, num_nodes) if is_lv_node[i]]
-                    cencosud_indices = [manager.NodeToIndex(i) for i in range(1, num_nodes) 
-                                       if node_group[i] == "CENCOSUD"]
-                    
+                    cencosud_indices = [manager.NodeToIndex(i) for i in range(1, num_nodes)
+                                        if node_group[i] == "CENCOSUD"]
                     for lv_idx in lv_indices:
                         lv_node = manager.IndexToNode(lv_idx)
                         for cenc_idx in cencosud_indices:
                             cenc_node = manager.IndexToNode(cenc_idx)
                             if cenc_node == lv_node:
                                 continue
-                            
-                            lv_active = routing.ActiveVar(lv_idx)
+                            lv_active   = routing.ActiveVar(lv_idx)
                             cenc_active = routing.ActiveVar(cenc_idx)
                             lv_next_var = routing.NextVar(start_idx)
-                            solver.Add((lv_active + cenc_active - 1) <= 
-                                     solver.IsEqualCstVar(lv_next_var, lv_idx))
+                            solver.Add((lv_active + cenc_active - 1) <=
+                                       solver.IsEqualCstVar(lv_next_var, lv_idx))
 
-        any_pa_exists = any(is_pa_node[1:])
-        any_lv_exists = any(is_lv_node[1:])
-        any_tier3_exists = any(
-            (is_tottus_node[i] or is_unimarc_node[i]) for i in range(1, len(is_tottus_node))
-        )
+        any_pa_exists     = any(is_pa_node[1:])
+        any_lv_exists     = any(is_lv_node[1:])
+        any_tier3_exists  = any((is_tottus_node[i] or is_unimarc_node[i]) for i in range(1, len(is_tottus_node)))
 
         def is_tier3(i):
             return is_tottus_node[i] or is_unimarc_node[i]
 
-        HIGH_PENALTY = 100_000
-        START_PENALTY_OTHER_WITH_PA = 90_000
-        START_PENALTY_TIER3_WITH_PA = 60_000
-        START_PENALTY_LV_WITH_PA    = 35_000
-        START_PENALTY_OTHER_WITH_LV = 60_000
-        START_PENALTY_TIER3_WITH_LV = 25_000
+        HIGH_PENALTY                 = 100_000
+        START_PENALTY_OTHER_WITH_PA  = 90_000
+        START_PENALTY_TIER3_WITH_PA  = 60_000
+        START_PENALTY_LV_WITH_PA     = 35_000
+        START_PENALTY_OTHER_WITH_LV  = 60_000
+        START_PENALTY_TIER3_WITH_LV  = 25_000
         START_PENALTY_OTHER_WITH_TIER3 = 45_000
-        PA_LATE_ENTRY_PENALTY       = 100_000
-        LV_LATE_ENTRY_PENALTY       = 70_000
-        TIER3_LATE_ENTRY_PENALTY    = 45_000
+        PA_LATE_ENTRY_PENALTY        = 100_000
+        LV_LATE_ENTRY_PENALTY        = 70_000
+        TIER3_LATE_ENTRY_PENALTY     = 45_000
         PA_AFTER_TIER3_EXTRA_PENALTY = 70_000
         LV_AFTER_TIER3_EXTRA_PENALTY = 40_000
 
@@ -614,16 +580,15 @@ def optimize():
                             (is_lv_node[from_node] and g_to == "CENCOSUD") or
                             (g_from == "CENCOSUD" and is_lv_node[to_node])
                         )
-                        
                         if not is_lv_exception:
                             if g_from != g_to and ("WALMART" in (g_from, g_to) or "CENCOSUD" in (g_from, g_to)):
                                 base += HIGH_PENALTY
-                    
+
                     if vehicle_mode[v_idx] == MODE_C:
                         if to_node != depot and is_lv_node[to_node]:
                             if from_node != depot and node_group[from_node] == "CENCOSUD":
-                                base += 50_000 
-                    
+                                base += 50_000
+
                     return base
                 return distance
             callback_idx = routing.RegisterTransitCallback(make_vehicle_callback(v))
@@ -638,8 +603,7 @@ def optimize():
         )
 
         PALET_SCALE = 100
-        vehicle_palets_scaled = [int(round(p * PALET_SCALE)) if p < PALLET_INF else PALLET_INF
-                                 for p in vehicle_palets]
+        vehicle_palets_scaled  = [int(round(p * PALET_SCALE)) if p < PALLET_INF else PALLET_INF for p in vehicle_palets]
         extended_palets_scaled = [int(round(p * PALET_SCALE)) for p in extended_palets]
 
         def palet_demand_callback(from_index):
@@ -652,45 +616,39 @@ def optimize():
 
         start_indices = set(routing.Start(v) for v in range(num_vehicles))
 
-        # -------------------------------------------------------------------------
-        # CALLBACK DE TIEMPO (Ahora el servicio se gestiona en el SlackVar)
-        # -------------------------------------------------------------------------
         def time_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
             to_node   = manager.IndexToNode(to_index)
-            travel = int(round(extended_time_matrix[from_node][to_node]))
+            travel  = int(round(extended_time_matrix[from_node][to_node]))
             service = 0
             if from_node == depot and from_index not in start_indices:
-                service += reload_service_time 
-            # El tiempo de espera se maneja ahora dinámicamente con SlackVar
+                service += reload_service_time
             return travel + service
 
         time_cb = routing.RegisterTransitCallback(time_callback)
 
-        # -------------------------------------------------------------------------
-        # DIMENSIÓN DE TIEMPO CON SLACK DINÁMICO
-        # -------------------------------------------------------------------------
         _max_opening_rel = max((int(v) for v in extended_opening[1:] if v is not None), default=0)
-        max_wait_val = max((int(round(w)) for w in extended_wait[1:]), default=0)
-        
+        max_wait_val     = max((int(round(w)) for w in extended_wait[1:]), default=0)
         slack_tiempo_espera = max(_max_opening_rel + 120, 120) + max_wait_val
         print(f"⏳ Slack de espera habilitado: {slack_tiempo_espera} min")
 
         routing.AddDimension(time_cb, slack_tiempo_espera, 10**7, False, "Time")
         time_dimension = routing.GetDimensionOrDie("Time")
 
+        # SlackVar: el camión permanece en el nodo al menos wait_here minutos
+        # (salvo que venga de un par de bodega compartida)
         for node in range(1, num_nodes):
-            idx = manager.NodeToIndex(node)
+            idx    = manager.NodeToIndex(node)
             w_here = int(round(extended_wait[node]))
             if w_here > 0:
-                pair_prev_indices = []
-                for prev_node in range(1, num_nodes):
-                    if is_shared_warehouse_pair(prev_node, node):
-                        pair_prev_indices.append(manager.NodeToIndex(prev_node))
-                
+                pair_prev_indices = [
+                    manager.NodeToIndex(prev_node)
+                    for prev_node in range(1, num_nodes)
+                    if is_shared_warehouse_pair(prev_node, node)
+                ]
                 if pair_prev_indices:
                     is_preceded_expr = solver.Sum([
-                        solver.IsEqualCstVar(routing.NextVar(p_idx), idx) 
+                        solver.IsEqualCstVar(routing.NextVar(p_idx), idx)
                         for p_idx in pair_prev_indices
                     ])
                     is_active = routing.ActiveVar(idx)
@@ -698,7 +656,10 @@ def optimize():
                 else:
                     solver.Add(time_dimension.SlackVar(idx) >= w_here * routing.ActiveVar(idx))
 
+        # Salida flexible: el solver elige la hora óptima dentro del rango permitido
+        MAX_DEPARTURE_SLACK = 720  # máximo 12h de retraso sobre la hora configurada
         vehicle_start_offsets = {}
+
         if reference_departure_minutes is not None:
             for v in range(num_vehicles):
                 base_idx = vehicle_mapping[v]
@@ -714,23 +675,21 @@ def optimize():
                         print(f"🌙 Offset cross-midnight corregido para vehículo base {base_idx}: "
                               f"{offset + 24*60} min → {offset} min "
                               f"({_fmt_hhmm(dep_abs)} salió antes que referencia {_fmt_hhmm(reference_departure_minutes)})")
-                start_idx = routing.Start(v)
+                start_idx       = routing.Start(v)
                 effective_start = max(0, offset)
-                MAX_DEPARTURE_SLACK = 720  # 12h máximo de retraso posible
-
                 time_dimension.CumulVar(start_idx).SetRange(
                     effective_start,
                     effective_start + MAX_DEPARTURE_SLACK
                 )
-                vehicle_start_offsets[v] = offset 
+                vehicle_start_offsets[v] = offset
         else:
             for v in range(num_vehicles):
                 start_idx = routing.Start(v)
                 time_dimension.CumulVar(start_idx).SetRange(0, 0)
                 vehicle_start_offsets[v] = 0
 
-        NP_SV_OPEN_ABS  = 20 * 60        
-        NP_SV_CLOSE_ABS = 23 * 60 + 59   
+        NP_SV_OPEN_ABS  = 20 * 60
+        NP_SV_CLOSE_ABS = 23 * 60 + 59
 
         if reference_departure_minutes is not None:
             for node in range(1, num_nodes):
@@ -749,12 +708,13 @@ def optimize():
                     if sv_open_rel  < -12 * 60: sv_open_rel  += 24 * 60
                     if sv_close_rel < -12 * 60: sv_close_rel += 24 * 60
 
-                    w1_ub        = None   
-                    w1_open_real = None   
+                    w1_ub        = None
+                    w1_open_real = None
 
                     if extended_deadline[node] is not None:
                         cl_gap = max(0, int(extended_closing_gap[node] or 0))
-                        w1_ub  = max(0, int(extended_deadline[node]) - cl_gap)
+                        # Ventana 1: el tiempo de servicio debe completarse antes del cierre efectivo
+                        w1_ub = max(0, int(extended_deadline[node]) - cl_gap - wait_here)
 
                     if extended_opening[node] is not None:
                         w1_open_real = int(extended_opening[node])
@@ -780,7 +740,6 @@ def optimize():
                         v1_open_str  = (_fmt_hhmm((reference_departure_minutes + w1_open_real) % (24 * 60))
                                         if w1_open_real is not None else "sin apertura")
                         v1_close_str = _fmt_hhmm((reference_departure_minutes + w1_ub) % (24 * 60))
-
                     else:
                         arrival_var.SetRange(0, sv_close_rel)
                         v1_open_str  = "—"
@@ -789,36 +748,37 @@ def optimize():
                     sv_open_clock  = _fmt_hhmm((reference_departure_minutes + sv_open_rel)  % (24 * 60))
                     sv_close_clock = _fmt_hhmm((reference_departure_minutes + sv_close_rel) % (24 * 60))
                     dia_str        = _DIA_NOMBRES[_dia_semana] if _dia_semana < 7 else "?"
-
                     print(f"🌙 DOBLE VENTANA ({dia_str}) — {loc_name} (ID {loc_id}):")
                     print(f"   Ventana 1 (JSON):   {v1_open_str} → {v1_close_str}")
                     print(f"   Ventana 2 (fija):   {sv_open_clock} → {sv_close_clock}")
 
                 else:
+                    # ── DEADLINE: el tiempo de servicio debe completarse antes del cierre efectivo ──
+                    # eff_deadline = cierre - gap_cierre - wait_here
+                    # Garantiza: llegada + wait_here <= cierre - gap_cierre
                     if extended_deadline[node] is not None:
                         cl_gap = int(extended_closing_gap[node]) if extended_closing_gap[node] is not None else 0
                         if cl_gap < 0:
                             cl_gap = 0
 
-                        eff_deadline = int(extended_deadline[node]) - cl_gap
+                        eff_deadline = int(extended_deadline[node]) - cl_gap - wait_here
                         ub = max(0, eff_deadline)
-
                         time_dimension.CumulVar(idx).SetRange(0, ub)
 
                         deadline_clock = _fmt_hhmm((reference_departure_minutes + eff_deadline) % (24 * 60))
-                        print(f"📅 {loc_name} (ID {loc_id}): debe llegar antes de {deadline_clock} "
-                              f"(deadline={eff_deadline} min desde salida, gap={cl_gap} min)")
+                        print(f"📅 {loc_name} (ID {loc_id}): debe LLEGAR antes de {deadline_clock} "
+                              f"(cierre={_fmt_hhmm((reference_departure_minutes + int(extended_deadline[node])) % (24*60))}, "
+                              f"gap={cl_gap} min, wait={wait_here} min)")
 
+                    # ── APERTURA: el camión debe estar en el nodo cuando abre ──
                     if extended_opening[node] is not None:
                         opening_real = int(extended_opening[node])
-
-                        arrival_var = time_dimension.CumulVar(idx)
+                        arrival_var  = time_dimension.CumulVar(idx)
                         solver.Add(arrival_var + wait_here >= opening_real)
 
                         op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
                         opening_clock          = _fmt_hhmm((reference_departure_minutes + opening_real) % (24 * 60))
                         earliest_arrival_clock = _fmt_hhmm((reference_departure_minutes + opening_real - op_gap) % (24 * 60))
-
                         print(f"📍 {loc_name} (ID {loc_id}):")
                         print(f"   ✓ Puede llegar desde las {earliest_arrival_clock} (gap={op_gap} min)")
                         print(f"   ✓ No puede salir antes de {opening_clock} (apertura real)")
@@ -835,7 +795,7 @@ def optimize():
 
         for v in range(num_vehicles):
             drive_dimension.CumulVar(routing.End(v)).SetMax(HORIZON)
-        
+
         for base in range(base_num_vehicles):
             end_cumuls = [
                 drive_dimension.CumulVar(routing.End(v))
@@ -843,16 +803,13 @@ def optimize():
             ]
             solver.Add(solver.Sum(end_cumuls) <= HORIZON)
 
-        # -------------------------------------------------------------------------
-        # CALLBACK DE PARADAS (Omite el límite para nodos emparejados)
-        # -------------------------------------------------------------------------
         def stop_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
-            to_node = manager.IndexToNode(to_index)
-            if to_node == depot: 
+            to_node   = manager.IndexToNode(to_index)
+            if to_node == depot:
                 return 0
             if is_shared_warehouse_pair(from_node, to_node):
-                return 0  
+                return 0
             return 1
 
         stop_cb = routing.RegisterTransitCallback(stop_callback)
@@ -863,16 +820,16 @@ def optimize():
 
         time_dimension.SetGlobalSpanCostCoefficient(50)
 
-        costo_varias_rutas = True
+        costo_varias_rutas  = True
         costo_reingreso_valor = int(data.get("costo_reingreso_valor", 100_000))
         if costo_varias_rutas:
             for v in range(num_vehicles):
                 if vehicle_trip_no[v] > 0:
                     routing.SetFixedCostOfVehicle(costo_reingreso_valor, v)
 
-        # ------------------------ Resolución del modelo ----------------------------
-        update_job_status(job_id, "optimizando", "Buscando la primera ruta factible (esto puede tomar un momento)...", 50)
-        
+        # ----------------------------- Resolución --------------------------------
+        update_job_status(job_id, "optimizando", "Buscando la primera ruta factible...", 50)
+
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = (
             routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -896,8 +853,8 @@ def optimize():
 
         class RoutingMonitor:
             def __init__(self, routing_model, current_job_id):
-                self.routing = routing_model
-                self.job_id = current_job_id
+                self.routing  = routing_model
+                self.job_id   = current_job_id
                 self.best_cost = float('inf')
 
             def __call__(self):
@@ -916,13 +873,12 @@ def optimize():
 
         update_job_status(job_id, "procesando_resultados", "Ruta definitiva calculada. Extrayendo itinerarios...", 90)
 
-        # ----------------------------- Extracción -------------------------------
+        # ----------------------------- Extracción --------------------------------
         vehicle_trips = {}
         total_distance, total_fuel_liters = 0.0, 0.0
         total_kg, total_units, total_palets_sum = 0.0, 0.0, 0.0
-
-        total_time_minutes_total = 0      
-        total_time_minutes_drive = 0      
+        total_time_minutes_total = 0
+        total_time_minutes_drive = 0
         total_stops_global = 0
 
         def cumul(dim, idx):
@@ -934,19 +890,16 @@ def optimize():
                 continue
 
             main_vehicle = vehicle_mapping[v]
-            trip_no = vehicle_trip_no[v]
-            mode = vehicle_mode[v]
-            actual_start = solution.Value(time_dimension.CumulVar(routing.Start(v)))
-            start_offset = actual_start  # en vez del offset calculado del input
+            trip_no      = vehicle_trip_no[v]
+            mode         = vehicle_mode[v]
 
-            # La hora de salida real del camión:
-            if reference_departure_minutes is not None:
-                actual_departure_abs = reference_departure_minutes + actual_start
-                departure_clock_v = _fmt_hhmm(actual_departure_abs)
+            # Leer la hora de salida real elegida por el solver
+            actual_start = solution.Value(time_dimension.CumulVar(routing.Start(v)))
+            start_offset = actual_start
 
             route_nodes = []
-            deliveries = []
-            dist_v = 0.0
+            deliveries  = []
+            dist_v      = 0.0
 
             index = start
             while not routing.IsEnd(index):
@@ -954,12 +907,12 @@ def optimize():
                 route_nodes.append(node)
 
                 if node != depot:
-                    ext = extended_locations[node]
-                    loc_id   = ext.get("id")
-                    demanda  = ext.get("demanda", {}) or {}
-                    precios  = ext.get("precios", {}) or {}
-                    pesos    = ext.get("pesos", {}) or {}
-                    packs    = ext.get("unidades", {}) or {}
+                    ext     = extended_locations[node]
+                    loc_id  = ext.get("id")
+                    demanda = ext.get("demanda", {}) or {}
+                    precios = ext.get("precios", {}) or {}
+                    pesos   = ext.get("pesos", {}) or {}
+                    packs   = ext.get("unidades", {}) or {}
 
                     products_detail = []
                     stop_kg, stop_units = 0.0, 0.0
@@ -969,66 +922,69 @@ def optimize():
                             kg = float(kg_val)
                         except Exception:
                             kg = float(str(kg_val).replace(",", ".")) if kg_val is not None else 0.0
-                        price = float(precios.get(pid_str, 0) or 0)
+                        price       = float(precios.get(pid_str, 0) or 0)
                         unit_weight = float(pesos.get(pid_str, 0) or 0)
                         pack_units  = int(packs.get(pid_str, 0) or 0)
-                        units = (kg / unit_weight) if unit_weight > 0 else None
-                        subtotal = kg * price
-                        stop_kg += kg
+                        units       = (kg / unit_weight) if unit_weight > 0 else None
+                        subtotal    = kg * price
+                        stop_kg    += kg
                         if units is not None:
                             stop_units += units
                         products_detail.append({
-                            "product_id": int(pid_str) if pid_str.isdigit() else pid_str,
-                            "kg": round(kg, 2),
-                            "price_unit": price,
+                            "product_id":     int(pid_str) if pid_str.isdigit() else pid_str,
+                            "kg":             round(kg, 2),
+                            "price_unit":     price,
                             "unit_weight_kg": (unit_weight if unit_weight > 0 else None),
-                            "units": (round(units, 2) if units is not None else None),
-                            "pack_units": (pack_units if pack_units > 0 else None),
-                            "subtotal": round(subtotal, 2)
+                            "units":          (round(units, 2) if units is not None else None),
+                            "pack_units":     (pack_units if pack_units > 0 else None),
+                            "subtotal":       round(subtotal, 2)
                         })
 
-                    idx = index
-                    time_cumul = cumul(time_dimension, idx)     
-                    drive_cumul = cumul(drive_dimension, idx)   
+                    idx        = index
+                    time_cumul  = cumul(time_dimension, idx)
+                    drive_cumul = cumul(drive_dimension, idx)
                     stops_cumul = cumul(stops_dimension, idx)
-                    
-                    # -----------------------------------------------------------------
-                    # APLICAR LECTURA DE ESPERA DE BODEGA COMPARTIDA EN LA EXTRACCIÓN
-                    # -----------------------------------------------------------------
+
+                    # wait_here: 0 si viene de un par compartido, normal en otro caso
                     prev_node_in_route = route_nodes[-2] if len(route_nodes) > 1 else depot
                     if is_shared_warehouse_pair(prev_node_in_route, node):
                         wait_here = 0
                     else:
                         wait_here = int(round(extended_wait[node]))
-                        
+
+                    # wait_for_deadline: siempre el valor completo (para calcular eff_deadline)
+                    # No se debe mezclar con wait_here que puede ser 0 por par compartido
+                    wait_for_deadline = int(round(extended_wait[node]))
+
                     op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
                     cl_gap = int(extended_closing_gap[node]) if extended_closing_gap[node] is not None else 0
                     if op_gap < 0: op_gap = 0
                     if cl_gap < 0: cl_gap = 0
 
-                    arrival_from_departure = time_cumul - start_offset
+                    arrival_from_departure   = time_cumul - start_offset
                     departure_from_departure = time_cumul + wait_here - start_offset
 
-                    if arrival_from_departure < 0:
-                        arrival_from_departure = 0
-                    if departure_from_departure < 0:
-                        departure_from_departure = 0
+                    if arrival_from_departure   < 0: arrival_from_departure   = 0
+                    if departure_from_departure < 0: departure_from_departure = 0
 
                     if extended_opening[node] is not None:
                         waiting_at_node_minutes = max(0, int(extended_opening[node]) - int(time_cumul))
                     else:
                         waiting_at_node_minutes = 0
 
-                    deadline_rel = extended_deadline[node]          
-                    deadline_ub_eff = None
-                    deadline_slack = None
-                    latest_arrival_from_departure = None
-                    deadline_from_departure = None
+                    deadline_rel                        = extended_deadline[node]
+                    deadline_ub_eff                     = None
+                    deadline_slack                      = None
+                    latest_arrival_from_departure       = None
+                    deadline_from_departure             = None
 
                     if deadline_rel is not None:
-                        eff_deadline = int(deadline_rel) - cl_gap
-                        deadline_ub_eff = max(0, eff_deadline) 
-                        deadline_from_departure = eff_deadline - start_offset
+                        # Mismo cálculo que en la constraint OR-Tools:
+                        # llegada + wait_for_deadline <= cierre - cl_gap
+                        # → llegada <= cierre - cl_gap - wait_for_deadline
+                        eff_deadline                  = int(deadline_rel) - cl_gap - wait_for_deadline
+                        deadline_ub_eff               = max(0, eff_deadline)
+                        deadline_from_departure       = eff_deadline - start_offset
                         latest_arrival_from_departure = deadline_ub_eff - start_offset
 
                         if latest_arrival_from_departure is not None:
@@ -1036,30 +992,29 @@ def optimize():
 
                     truck_departure_abs = (
                         (reference_departure_minutes + start_offset)
-                        if reference_departure_minutes is not None
-                        else None
+                        if reference_departure_minutes is not None else None
                     )
 
-                    eta_clock  = None
-                    etd_clock  = None
-                    open_clock = None      
-                    close_clock = None     
-                    open_eff_clock  = None   
-                    close_eff_clock = None   
+                    eta_clock       = None
+                    etd_clock       = None
+                    open_clock      = None
+                    close_clock     = None
+                    open_eff_clock  = None
+                    close_eff_clock = None
 
                     if truck_departure_abs is not None:
-                        eta_clock  = _fmt_hhmm(truck_departure_abs + arrival_from_departure)
-                        etd_clock  = _fmt_hhmm(truck_departure_abs + departure_from_departure)
+                        eta_clock = _fmt_hhmm(truck_departure_abs + arrival_from_departure)
+                        etd_clock = _fmt_hhmm(truck_departure_abs + departure_from_departure)
 
                     if reference_departure_minutes is not None:
                         if extended_opening[node] is not None:
-                            open_abs        = reference_departure_minutes + extended_opening[node]
-                            open_clock      = _fmt_hhmm(open_abs)
-                            open_eff_clock  = _fmt_hhmm(open_abs - op_gap)
+                            open_abs       = reference_departure_minutes + extended_opening[node]
+                            open_clock     = _fmt_hhmm(open_abs)
+                            open_eff_clock = _fmt_hhmm(open_abs - op_gap)
                         if extended_deadline[node] is not None:
-                            close_abs        = reference_departure_minutes + extended_deadline[node]
-                            close_clock      = _fmt_hhmm(close_abs)
-                            close_eff_clock  = _fmt_hhmm(close_abs - cl_gap)
+                            close_abs       = reference_departure_minutes + extended_deadline[node]
+                            close_clock     = _fmt_hhmm(close_abs)
+                            close_eff_clock = _fmt_hhmm(close_abs - cl_gap)
 
                     opening_from_departure = None
                     closing_from_departure = None
@@ -1074,27 +1029,27 @@ def optimize():
                         margin_open = int(eff_open_from_dep) - int(arrival_from_departure)
 
                     deliveries.append({
-                        "location_id": loc_id,
+                        "location_id":   loc_id,
                         "identificador": ext.get("identificador"),
-                        "node_index": node,
-                        "group": node_group[node],
+                        "node_index":    node,
+                        "group":         node_group[node],
                         "requires_refrigeration": bool(extended_refrigerate[node]),
-                        "products": demanda,
-                        "products_detail": products_detail,
+                        "products":         demanda,
+                        "products_detail":  products_detail,
                         "totals": {
-                            "kg": round(stop_kg, 2),
-                            "units": (round(stop_units, 2) if stop_units > 0 else None),
+                            "kg":     round(stop_kg, 2),
+                            "units":  (round(stop_units, 2) if stop_units > 0 else None),
                             "palets": round(extended_palets[node], 2)
                         },
                         "timing": {
-                            "eta_clock":  eta_clock,   
-                            "etd_clock":  etd_clock,   
-                            "wait_minutes": int(wait_here),
-                            "waiting_at_node_minutes": int(waiting_at_node_minutes),
-                            "open_clock":       open_clock,       
-                            "close_clock":      close_clock,      
-                            "open_eff_clock":   open_eff_clock,   
-                            "close_eff_clock":  close_eff_clock,  
+                            "eta_clock":  eta_clock,
+                            "etd_clock":  etd_clock,
+                            "wait_minutes":             int(wait_here),
+                            "waiting_at_node_minutes":  int(waiting_at_node_minutes),
+                            "open_clock":       open_clock,
+                            "close_clock":      close_clock,
+                            "open_eff_clock":   open_eff_clock,
+                            "close_eff_clock":  close_eff_clock,
                             "opening_gap_minutes": int(op_gap),
                             "closing_gap_minutes": int(cl_gap),
                             "arrival_minutes_from_departure":   int(arrival_from_departure),
@@ -1120,44 +1075,50 @@ def optimize():
                             ),
                         },
                         "cumul": {
-                            "time_cumul_minutes":    int(time_cumul),
-                            "time_from_departure":   int(arrival_from_departure),
-                            "drive_cumul_minutes":   int(drive_cumul),
-                            "stops_cumul":           int(stops_cumul)
+                            "time_cumul_minutes":  int(time_cumul),
+                            "time_from_departure": int(arrival_from_departure),
+                            "drive_cumul_minutes": int(drive_cumul),
+                            "stops_cumul":         int(stops_cumul)
                         }
                     })
 
-                prev = index
+                prev  = index
                 index = solution.Value(routing.NextVar(index))
-                d = extended_distance_matrix[manager.IndexToNode(prev)][manager.IndexToNode(index)]
-                dist_v += d
+                d     = extended_distance_matrix[manager.IndexToNode(prev)][manager.IndexToNode(index)]
+                dist_v       += d
                 total_distance += d
 
-            time_total  = solution.Value(time_dimension.CumulVar(routing.End(v)))  
-            time_drive  = solution.Value(drive_dimension.CumulVar(routing.End(v))) 
+            time_drive  = solution.Value(drive_dimension.CumulVar(routing.End(v)))
             stops_count = solution.Value(stops_dimension.CumulVar(routing.End(v)))
 
-            duration_end = int(time_total) - start_offset
-            if duration_end < 0:
-                duration_end = 0
-
-            total_time_minutes_total += duration_end   
             total_time_minutes_drive += int(time_drive)
-            total_stops_global += int(stops_count)
+            total_stops_global       += int(stops_count)
 
             fuel = dist_v / max(vehicle_consume[v], 1e-9)
             total_fuel_liters += fuel
 
             if not deliveries:
                 continue
-            trip_kg = sum((d["totals"]["kg"] for d in deliveries if d.get("totals")), 0.0)
+
+            # ── return_clock y duration desde la última entrega + drive de vuelta ──
+            # No usar time_dimension.CumulVar(End) porque SetGlobalSpanCostCoefficient
+            # lo infla al span del vehículo más largo.
+            last_dep_from_dep  = int(deliveries[-1]["timing"]["departure_minutes_from_departure"])
+            last_node_in_route = route_nodes[-1]   # último nodo de entrega (no el depósito final)
+            drive_back         = int(round(extended_time_matrix[last_node_in_route][depot]))
+            return_minutes_from_departure = max(0, last_dep_from_dep + drive_back)
+            duration_end = return_minutes_from_departure
+
+            total_time_minutes_total += duration_end
+
+            trip_kg         = sum((d["totals"]["kg"]    for d in deliveries if d.get("totals")), 0.0)
             trip_units_vals = [d["totals"].get("units") for d in deliveries if d.get("totals")]
-            trip_units_sum = sum((u for u in trip_units_vals if u is not None), 0.0)
+            trip_units_sum  = sum((u for u in trip_units_vals if u is not None), 0.0)
             trip_palets_sum = sum(d["totals"].get("palets", 0.0) for d in deliveries if d.get("totals"))
 
             raw_route = [0] + [
                 extended_locations[n].get("id") if n else 0
-                for n in [node for node in route_nodes]
+                for n in route_nodes
             ] + [0]
             cleaned_route = [raw_route[0]]
             for n in raw_route[1:]:
@@ -1170,9 +1131,6 @@ def optimize():
             )
             departure_clock_v = _fmt_hhmm(dep_abs_v) if dep_abs_v is not None else None
 
-            return_minutes_from_departure = int(time_total) - start_offset
-            if return_minutes_from_departure < 0:
-                return_minutes_from_departure = 0
             return_clock_v = (
                 _fmt_hhmm(dep_abs_v + return_minutes_from_departure)
                 if dep_abs_v is not None else None
@@ -1180,18 +1138,18 @@ def optimize():
             trip_duration_minutes = return_minutes_from_departure
 
             agg = vehicle_trips.setdefault(main_vehicle, {
-                "vehicle": main_vehicle,
-                "departure_clock": departure_clock_v,   
-                "trips": [],
-                "total_distance": 0.0,
-                "total_fuel_liters": 0.0,
-                "total_kg": 0.0,
-                "total_units": 0.0,
-                "total_palets": 0.0,
+                "vehicle":                 main_vehicle,
+                "departure_clock":         departure_clock_v,
+                "trips":                   [],
+                "total_distance":          0.0,
+                "total_fuel_liters":       0.0,
+                "total_kg":                0.0,
+                "total_units":             0.0,
+                "total_palets":            0.0,
                 "total_time_minutes_total": 0,
                 "total_time_minutes_drive": 0,
-                "total_stops": 0,
-                "capacity_kg": float(vehicle_capacities_base[main_vehicle]),
+                "total_stops":             0,
+                "capacity_kg":     float(vehicle_capacities_base[main_vehicle]),
                 "capacity_palets": (
                     int(vehicle_palets_base[main_vehicle])
                     if vehicle_palets_base[main_vehicle] < PALLET_INF else None
@@ -1200,48 +1158,50 @@ def optimize():
             })
 
             agg["trips"].append({
-                "trip_no": trip_no,
-                "mode": mode,  
-                "route": cleaned_route,
-                "deliveries": deliveries,
-                "num_stops": int(stops_count),
-                "departure_clock": departure_clock_v,      
-                "return_clock": return_clock_v,            
-                "duration_minutes": trip_duration_minutes, 
-                "time_minutes_total": duration_end,        
-                "time_minutes_drive": int(time_drive),     
-                "distance": float(dist_v),
-                "fuel_liters": float(fuel),
-                "total_kg": round(trip_kg, 2),
-                "total_units": (round(trip_units_sum, 2) if trip_units_sum > 0 else None),
-                "total_palets": round(trip_palets_sum, 2)
+                "trip_no":            trip_no,
+                "mode":               mode,
+                "route":              cleaned_route,
+                "deliveries":         deliveries,
+                "num_stops":          int(stops_count),
+                "departure_clock":    departure_clock_v,
+                "return_clock":       return_clock_v,
+                "duration_minutes":   trip_duration_minutes,
+                "time_minutes_total": duration_end,
+                "time_minutes_drive": int(time_drive),
+                "distance":           float(dist_v),
+                "fuel_liters":        float(fuel),
+                "total_kg":           round(trip_kg, 2),
+                "total_units":        (round(trip_units_sum, 2) if trip_units_sum > 0 else None),
+                "total_palets":       round(trip_palets_sum, 2)
             })
 
-            agg["total_distance"] += float(dist_v)
-            agg["total_fuel_liters"] += float(fuel)
-            agg["total_kg"] += float(trip_kg)
-            agg["total_units"] += float(trip_units_sum)
-            agg["total_palets"] += float(trip_palets_sum)
-
-            agg["total_time_minutes_total"] += duration_end
-            agg["total_time_minutes_drive"] += int(time_drive)
-            agg["total_stops"] += int(stops_count)
+            agg["total_distance"]           += float(dist_v)
+            agg["total_fuel_liters"]         += float(fuel)
+            agg["total_kg"]                  += float(trip_kg)
+            agg["total_units"]               += float(trip_units_sum)
+            agg["total_palets"]              += float(trip_palets_sum)
+            agg["total_time_minutes_total"]  += duration_end
+            agg["total_time_minutes_drive"]  += int(time_drive)
+            agg["total_stops"]               += int(stops_count)
             agg["modes_used"].add(int(mode))
 
-            total_kg += float(trip_kg)
-            total_units += float(trip_units_sum)
-            total_palets_sum += float(trip_palets_sum)
+            total_kg           += float(trip_kg)
+            total_units        += float(trip_units_sum)
+            total_palets_sum   += float(trip_palets_sum)
 
         # ─────────────────────────────────────────────────────────────────────
         # POST-PROCESAMIENTO: MODOS + FINE-TUNING DE HORA DE SALIDA
         # ─────────────────────────────────────────────────────────────────────
-        SAFETY_MARGIN_MINUTES = 30
+        SAFETY_MARGIN_MINUTES = 3000
+
+        max_vehicle_time_total = 0
+        max_vehicle_time_drive = 0
 
         for vdata in vehicle_trips.values():
-            modes_set = vdata.get("modes_used", set())
+            modes_set   = vdata.get("modes_used", set())
             mode_labels = {0: "OTHER", 1: "WALMART", 2: "CENCOSUD"}
             vdata["modes_used"] = {
-                "ids": sorted(modes_set),
+                "ids":    sorted(modes_set),
                 "labels": [mode_labels[m] for m in sorted(modes_set) if m in mode_labels]
             }
 
@@ -1250,7 +1210,8 @@ def optimize():
                 if not deliveries:
                     continue
 
-                # Usar deadline_slack mínimo como límite real de retraso posible
+                # El deadline_slack ya incluye wait_for_deadline en el cálculo de la constraint,
+                # por lo que min(deadline_slacks) es el retraso máximo que puede absorber la ruta.
                 deadline_slacks = [
                     int(d["timing"]["deadline_slack_minutes"])
                     for d in deliveries
@@ -1259,13 +1220,10 @@ def optimize():
                 if not deadline_slacks:
                     continue
 
-                max_valid_delay = min(deadline_slacks)
-                optimal_delay   = max(0, max_valid_delay - SAFETY_MARGIN_MINUTES)
-
+                optimal_delay = max(0, min(deadline_slacks) - SAFETY_MARGIN_MINUTES)
                 if optimal_delay <= 0:
                     continue
 
-                # Sobreescribir hora de salida
                 new_dep_clock          = _add_minutes_to_clock(vdata.get("departure_clock"), optimal_delay)
                 vdata["departure_clock"] = new_dep_clock
                 trip["departure_clock"]  = new_dep_clock
@@ -1274,6 +1232,9 @@ def optimize():
 
                 for d in deliveries:
                     timing = d["timing"]
+
+                    # Guardar el delta de llegada ANTES de absorber la espera
+                    arrival_delta = current_delay
 
                     timing["eta_clock"] = _add_minutes_to_clock(timing.get("eta_clock"), current_delay)
                     timing["arrival_minutes_from_departure"] = (
@@ -1293,8 +1254,10 @@ def optimize():
                         int(timing.get("departure_minutes_from_departure") or 0)
                         - (optimal_delay - current_delay)
                     )
+
+                    # deadline_slack disminuye solo en la cantidad que realmente aumentó la llegada
                     if timing.get("deadline_slack_minutes") is not None:
-                        timing["deadline_slack_minutes"] = int(timing["deadline_slack_minutes"]) - optimal_delay
+                        timing["deadline_slack_minutes"] = int(timing["deadline_slack_minutes"]) - arrival_delta
 
                 trip["return_clock"]       = _add_minutes_to_clock(trip.get("return_clock"), current_delay)
                 time_saved                 = optimal_delay - current_delay
@@ -1302,19 +1265,15 @@ def optimize():
                 trip["time_minutes_total"] = int(trip.get("time_minutes_total") or 0) - time_saved
                 vdata["total_time_minutes_total"] = trip["time_minutes_total"]
 
-        # Max/avg después del fine-tuning
-        max_vehicle_time_total = 0
-        max_vehicle_time_drive = 0
-        for vdata in vehicle_trips.values():
             max_vehicle_time_total = max(max_vehicle_time_total, vdata["total_time_minutes_total"])
             max_vehicle_time_drive = max(max_vehicle_time_drive, vdata["total_time_minutes_drive"])
-        vehicles_used = len(vehicle_trips)
+
+        vehicles_used          = len(vehicle_trips)
         avg_vehicle_time_total = (total_time_minutes_total / vehicles_used) if vehicles_used > 0 else 0.0
         avg_vehicle_time_drive = (total_time_minutes_drive / vehicles_used) if vehicles_used > 0 else 0.0
 
         reference_departure_time_str = (
-            _fmt_hhmm(reference_departure_minutes)
-            if reference_departure_minutes is not None else None
+            _fmt_hhmm(reference_departure_minutes) if reference_departure_minutes is not None else None
         )
 
         update_job_status(job_id, "completado", "Optimización finalizada exitosamente.", 100)
@@ -1322,36 +1281,36 @@ def optimize():
         return jsonify({
             "status": "success",
             "meta": {
-                "max_vehicles": base_num_vehicles,
-                "max_trips_per_vehicle": max_trips_per_vehicle,
+                "max_vehicles":               base_num_vehicles,
+                "max_trips_per_vehicle":      max_trips_per_vehicle,
                 "time_horizon_drive_minutes": HORIZON,
-                "max_stops_per_vehicle": maximo_de_paradas,
-                "time_multiplier": multiplicador_tiempo,
+                "max_stops_per_vehicle":      maximo_de_paradas,
+                "time_multiplier":            multiplicador_tiempo,
                 "reload_service_time_minutes": reload_service_time,
-                "vehicle_departure_times": vehicle_departure_times_raw,
-                "departure_times_by_truck": departure_times_by_truck_raw,
-                "reference_departure_time": reference_departure_time_str,
-                "departure_time_global": departure_time_global_str or reference_departure_time_str,
-                "departure_time":        departure_time_global_str or reference_departure_time_str,
-                "workers": req_workers,
-                "vehicles_used": len(vehicle_trips),
+                "vehicle_departure_times":    vehicle_departure_times_raw,
+                "departure_times_by_truck":   departure_times_by_truck_raw,
+                "reference_departure_time":   reference_departure_time_str,
+                "departure_time_global":      departure_time_global_str or reference_departure_time_str,
+                "departure_time":             departure_time_global_str or reference_departure_time_str,
+                "workers":                    req_workers,
+                "vehicles_used":              len(vehicle_trips),
                 "max_vehicle_time_minutes_total": int(max_vehicle_time_total),
                 "max_vehicle_time_minutes_drive": int(max_vehicle_time_drive),
                 "avg_vehicle_time_minutes_total": int(round(avg_vehicle_time_total)),
                 "avg_vehicle_time_minutes_drive": int(round(avg_vehicle_time_drive))
             },
             "totals": {
-                "total_distance": round(total_distance, 2),
-                "total_fuel_liters": round(total_fuel_liters, 2),
-                "total_kg": round(total_kg, 2),
-                "total_units": (round(total_units, 2) if total_units > 0 else None),
-                "total_palets": round(total_palets_sum, 2),
+                "total_distance":         round(total_distance, 2),
+                "total_fuel_liters":      round(total_fuel_liters, 2),
+                "total_kg":               round(total_kg, 2),
+                "total_units":            (round(total_units, 2) if total_units > 0 else None),
+                "total_palets":           round(total_palets_sum, 2),
                 "total_time_minutes_total": int(total_time_minutes_total),
                 "total_time_minutes_drive": int(total_time_minutes_drive),
-                "total_stops": int(total_stops_global)
+                "total_stops":            int(total_stops_global)
             },
             "vehicles_used": len(vehicle_trips),
-            "assignments": list(vehicle_trips.values())
+            "assignments":   list(vehicle_trips.values())
         })
 
     except Exception as e:

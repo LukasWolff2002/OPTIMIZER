@@ -275,7 +275,7 @@ def optimize():
 
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
-            MAX_WAIT_MINUTES = 60
+            MAX_WAIT_MINUTES = 30
             if wait_minutes > MAX_WAIT_MINUTES:
                 wait_minutes = MAX_WAIT_MINUTES
 
@@ -1236,39 +1236,21 @@ def optimize():
 
             for trip in vdata.get("trips", []):
                 deliveries = trip.get("deliveries", [])
-
-                total_wait = sum(
-                    int(d.get("timing", {}).get("waiting_at_node_minutes") or 0)
-                    for d in deliveries
-                )
-                if total_wait <= 0:
+                if not deliveries:
                     continue
 
-                # Buscar el máximo retraso que no viola ningún deadline
-                max_valid_delay = 0
-                for test_delay in range(total_wait, -1, -1):
-                    valid         = True
-                    current_delay = test_delay
+                # Usar deadline_slack mínimo como límite real de retraso posible
+                deadline_slacks = [
+                    int(d["timing"]["deadline_slack_minutes"])
+                    for d in deliveries
+                    if d.get("timing", {}).get("deadline_slack_minutes") is not None
+                ]
+                if not deadline_slacks:
+                    continue
 
-                    for d in deliveries:
-                        timing       = d.get("timing", {})
-                        max_arrival  = timing.get("latest_arrival_allowed_minutes_from_departure")
-                        orig_arrival = int(timing.get("arrival_minutes_from_departure") or 0)
+                max_valid_delay = min(deadline_slacks)
+                optimal_delay   = max(0, max_valid_delay - SAFETY_MARGIN_MINUTES)
 
-                        if max_arrival is not None and (orig_arrival + current_delay > int(max_arrival)):
-                            valid = False
-                            break
-
-                        wait_time     = int(timing.get("waiting_at_node_minutes") or 0)
-                        current_delay = max(0, current_delay - wait_time)
-                        if current_delay == 0:
-                            break
-
-                    if valid:
-                        max_valid_delay = test_delay
-                        break
-
-                optimal_delay = max(0, max_valid_delay - SAFETY_MARGIN_MINUTES)
                 if optimal_delay <= 0:
                     continue
 
@@ -1301,7 +1283,7 @@ def optimize():
                         - (optimal_delay - current_delay)
                     )
                     if timing.get("deadline_slack_minutes") is not None:
-                        timing["deadline_slack_minutes"] = int(timing["deadline_slack_minutes"]) - current_delay
+                        timing["deadline_slack_minutes"] = int(timing["deadline_slack_minutes"]) - optimal_delay
 
                 trip["return_clock"]       = _add_minutes_to_clock(trip.get("return_clock"), current_delay)
                 time_saved                 = optimal_delay - current_delay

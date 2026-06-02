@@ -1227,7 +1227,6 @@ def optimize():
         SAFETY_MARGIN_MINUTES = 30
 
         for vdata in vehicle_trips.values():
-            # Etiquetas de modo
             modes_set = vdata.get("modes_used", set())
             mode_labels = {0: "OTHER", 1: "WALMART", 2: "CENCOSUD"}
             vdata["modes_used"] = {
@@ -1235,16 +1234,8 @@ def optimize():
                 "labels": [mode_labels[m] for m in sorted(modes_set) if m in mode_labels]
             }
 
-            original_dep = vdata.get("departure_clock")
-            vdata["requested_departure_clock"] = original_dep
-            vdata["optimal_departure_clock"]   = original_dep
-            vdata["departure_delay_minutes"]   = 0
-
             for trip in vdata.get("trips", []):
                 deliveries = trip.get("deliveries", [])
-                trip["requested_departure_clock"] = original_dep
-                trip["optimal_departure_clock"]   = original_dep
-                trip["departure_delay_minutes"]   = 0
 
                 total_wait = sum(
                     int(d.get("timing", {}).get("waiting_at_node_minutes") or 0)
@@ -1281,28 +1272,22 @@ def optimize():
                 if optimal_delay <= 0:
                     continue
 
-                new_dep_clock = _add_minutes_to_clock(original_dep, optimal_delay)
-
-                vdata["departure_delay_minutes"] = optimal_delay
-                vdata["departure_clock"]         = new_dep_clock
-                vdata["optimal_departure_clock"] = new_dep_clock
-                trip["departure_delay_minutes"]  = optimal_delay
-                trip["departure_clock"]          = new_dep_clock
-                trip["optimal_departure_clock"]  = new_dep_clock
+                # Sobreescribir hora de salida
+                new_dep_clock          = _add_minutes_to_clock(vdata.get("departure_clock"), optimal_delay)
+                vdata["departure_clock"] = new_dep_clock
+                trip["departure_clock"]  = new_dep_clock
 
                 current_delay = optimal_delay
 
                 for d in deliveries:
                     timing = d["timing"]
 
-                    # Llegada
                     timing["eta_clock"] = _add_minutes_to_clock(timing.get("eta_clock"), current_delay)
                     timing["arrival_minutes_from_departure"] = (
                         int(timing.get("arrival_minutes_from_departure") or 0)
                         - (optimal_delay - current_delay)
                     )
 
-                    # Absorber espera
                     wait_time     = int(timing.get("waiting_at_node_minutes") or 0)
                     new_wait_time = max(0, wait_time - current_delay)
                     unload_time   = int(timing.get("wait_minutes") or 0) - wait_time
@@ -1310,7 +1295,6 @@ def optimize():
                     timing["wait_minutes"]            = new_wait_time + unload_time
                     current_delay                     = max(0, current_delay - wait_time)
 
-                    # Salida
                     timing["etd_clock"] = _add_minutes_to_clock(timing.get("etd_clock"), current_delay)
                     timing["departure_minutes_from_departure"] = (
                         int(timing.get("departure_minutes_from_departure") or 0)
@@ -1319,20 +1303,18 @@ def optimize():
                     if timing.get("deadline_slack_minutes") is not None:
                         timing["deadline_slack_minutes"] = int(timing["deadline_slack_minutes"]) - current_delay
 
-                # Retorno y duración
                 trip["return_clock"]       = _add_minutes_to_clock(trip.get("return_clock"), current_delay)
                 time_saved                 = optimal_delay - current_delay
                 trip["duration_minutes"]   = int(trip.get("duration_minutes") or 0) - time_saved
                 trip["time_minutes_total"] = int(trip.get("time_minutes_total") or 0) - time_saved
                 vdata["total_time_minutes_total"] = trip["time_minutes_total"]
 
-        # Max/avg DESPUÉS del fine-tuning para reflejar los valores reales
+        # Max/avg después del fine-tuning
         max_vehicle_time_total = 0
         max_vehicle_time_drive = 0
         for vdata in vehicle_trips.values():
             max_vehicle_time_total = max(max_vehicle_time_total, vdata["total_time_minutes_total"])
             max_vehicle_time_drive = max(max_vehicle_time_drive, vdata["total_time_minutes_drive"])
-            
         vehicles_used = len(vehicle_trips)
         avg_vehicle_time_total = (total_time_minutes_total / vehicles_used) if vehicles_used > 0 else 0.0
         avg_vehicle_time_drive = (total_time_minutes_drive / vehicles_used) if vehicles_used > 0 else 0.0

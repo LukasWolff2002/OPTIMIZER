@@ -173,10 +173,17 @@ def optimize():
                 vehicle_departure_minutes_base[idx] = minutes
                 reference_candidates.append(minutes)
 
+        # DESPUÉS
         reference_departure_minutes = None
         if reference_candidates:
-            reference_departure_minutes = min(reference_candidates)
-
+            # Si hay salidas que cruzan medianoche (ej: 22:00 y 00:00 en el mismo ciclo),
+            # min() elegiría 00:00 siendo que 22:00 es la salida más temprana del ciclo real.
+            # Se normalizan los tiempos < 12h sumando 24h para resolverlo.
+            if max(reference_candidates) - min(reference_candidates) > 12 * 60:
+                adjusted = [t + 24 * 60 if t < 12 * 60 else t for t in reference_candidates]
+                reference_departure_minutes = min(adjusted) % (24 * 60)
+            else:
+                reference_departure_minutes = min(reference_candidates)
         if len(vehicle_capacities_base) != base_num_vehicles:
             return jsonify(error="capacidades no coinciden con max_vehicles"), 400
         if len(vehicle_consume_base) != base_num_vehicles:

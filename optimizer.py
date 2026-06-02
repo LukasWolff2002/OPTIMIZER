@@ -306,7 +306,7 @@ def optimize():
                     else:
                         open_minutes = _parse_departure_minutes(str(open_time_raw))
                     delta_open = open_minutes - reference_departure_minutes
-                    if delta_open < -12 * 60:  
+                    if delta_open < 0:
                         delta_open += 24 * 60
                     opening_minutes_rel = int(delta_open)
                 except Exception:

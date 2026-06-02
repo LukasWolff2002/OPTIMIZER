@@ -275,7 +275,7 @@ def optimize():
 
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
-            MAX_WAIT_MINUTES = 60
+            MAX_WAIT_MINUTES = 30
             if wait_minutes > MAX_WAIT_MINUTES:
                 wait_minutes = MAX_WAIT_MINUTES
 
@@ -800,9 +800,9 @@ def optimize():
                         if cl_gap < 0:
                             cl_gap = 0
 
-                        wait_here = int(round(extended_wait[node]))
-                        eff_deadline = int(extended_deadline[node]) - cl_gap - wait_here
+                        eff_deadline = int(extended_deadline[node]) - cl_gap
                         ub = max(0, eff_deadline)
+
                         time_dimension.CumulVar(idx).SetRange(0, ub)
 
                         deadline_clock = _fmt_hhmm((reference_departure_minutes + eff_deadline) % (24 * 60))
@@ -1026,9 +1026,8 @@ def optimize():
                     deadline_from_departure = None
 
                     if deadline_rel is not None:
-                        wait_here = int(round(extended_wait[node]))
-                        eff_deadline = int(deadline_rel) - cl_gap - wait_here   # ← agregar - wait_here
-                        deadline_ub_eff = max(0, eff_deadline)
+                        eff_deadline = int(deadline_rel) - cl_gap
+                        deadline_ub_eff = max(0, eff_deadline) 
                         deadline_from_departure = eff_deadline - start_offset
                         latest_arrival_from_departure = deadline_ub_eff - start_offset
 

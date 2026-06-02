@@ -275,7 +275,7 @@ def optimize():
 
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
-            MAX_WAIT_MINUTES = 30
+            MAX_WAIT_MINUTES = 100000
             if wait_minutes > MAX_WAIT_MINUTES:
                 wait_minutes = MAX_WAIT_MINUTES
 
@@ -861,7 +861,7 @@ def optimize():
         for v in range(num_vehicles):
             stops_dimension.CumulVar(routing.End(v)).SetMax(maximo_de_paradas)
 
-        #time_dimension.SetGlobalSpanCostCoefficient(50)
+        time_dimension.SetGlobalSpanCostCoefficient(50)
 
         costo_varias_rutas = True
         costo_reingreso_valor = int(data.get("costo_reingreso_valor", 100_000))
@@ -1133,18 +1133,13 @@ def optimize():
                 dist_v += d
                 total_distance += d
 
-            # DESPUÉS
-            time_total  = solution.Value(time_dimension.CumulVar(routing.End(v)))
-            time_drive  = solution.Value(drive_dimension.CumulVar(routing.End(v)))
+            time_total  = solution.Value(time_dimension.CumulVar(routing.End(v)))  
+            time_drive  = solution.Value(drive_dimension.CumulVar(routing.End(v))) 
             stops_count = solution.Value(stops_dimension.CumulVar(routing.End(v)))
 
-            if deliveries:
-                last_node_for_return = route_nodes[-1]
-                last_etd_from_dep    = int(deliveries[-1]["timing"]["departure_minutes_from_departure"])
-                drive_back_min       = int(round(extended_time_matrix[last_node_for_return][depot]))
-                duration_end         = max(0, last_etd_from_dep + drive_back_min)
-            else:
-                duration_end = max(0, int(time_total) - start_offset)
+            duration_end = int(time_total) - start_offset
+            if duration_end < 0:
+                duration_end = 0
 
             total_time_minutes_total += duration_end   
             total_time_minutes_drive += int(time_drive)
@@ -1175,7 +1170,9 @@ def optimize():
             )
             departure_clock_v = _fmt_hhmm(dep_abs_v) if dep_abs_v is not None else None
 
-            return_minutes_from_departure = duration_end
+            return_minutes_from_departure = int(time_total) - start_offset
+            if return_minutes_from_departure < 0:
+                return_minutes_from_departure = 0
             return_clock_v = (
                 _fmt_hhmm(dep_abs_v + return_minutes_from_departure)
                 if dep_abs_v is not None else None
@@ -1275,24 +1272,21 @@ def optimize():
 
                 current_delay = optimal_delay
 
-                # DESPUÉS — capturar arrival_delay antes de la absorción
                 for d in deliveries:
                     timing = d["timing"]
 
-                    arrival_delay = current_delay  # delay en llegada (antes de absorber en este nodo)
-
-                    timing["eta_clock"] = _add_minutes_to_clock(timing.get("eta_clock"), arrival_delay)
+                    timing["eta_clock"] = _add_minutes_to_clock(timing.get("eta_clock"), current_delay)
                     timing["arrival_minutes_from_departure"] = (
                         int(timing.get("arrival_minutes_from_departure") or 0)
-                        - (optimal_delay - arrival_delay)
+                        - (optimal_delay - current_delay)
                     )
 
                     wait_time     = int(timing.get("waiting_at_node_minutes") or 0)
-                    new_wait_time = max(0, wait_time - arrival_delay)
+                    new_wait_time = max(0, wait_time - current_delay)
                     unload_time   = int(timing.get("wait_minutes") or 0) - wait_time
                     timing["waiting_at_node_minutes"] = new_wait_time
                     timing["wait_minutes"]            = new_wait_time + unload_time
-                    current_delay                     = max(0, arrival_delay - wait_time)  # delay después de absorción
+                    current_delay                     = max(0, current_delay - wait_time)
 
                     timing["etd_clock"] = _add_minutes_to_clock(timing.get("etd_clock"), current_delay)
                     timing["departure_minutes_from_departure"] = (
@@ -1300,7 +1294,7 @@ def optimize():
                         - (optimal_delay - current_delay)
                     )
                     if timing.get("deadline_slack_minutes") is not None:
-                        timing["deadline_slack_minutes"] = int(timing["deadline_slack_minutes"]) - arrival_delay
+                        timing["deadline_slack_minutes"] = int(timing["deadline_slack_minutes"]) - optimal_delay
 
                 trip["return_clock"]       = _add_minutes_to_clock(trip.get("return_clock"), current_delay)
                 time_saved                 = optimal_delay - current_delay

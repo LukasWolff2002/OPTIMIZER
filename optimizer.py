@@ -1192,7 +1192,7 @@ def optimize():
         # ─────────────────────────────────────────────────────────────────────
         # POST-PROCESAMIENTO: MODOS + FINE-TUNING DE HORA DE SALIDA
         # ─────────────────────────────────────────────────────────────────────
-        SAFETY_MARGIN_MINUTES = 3000
+        SAFETY_MARGIN_MINUTES = 30
 
         max_vehicle_time_total = 0
         max_vehicle_time_drive = 0

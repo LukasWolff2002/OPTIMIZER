@@ -266,8 +266,11 @@ def optimize():
 
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
-            MAX_WAIT_MINUTES = 60
+            # Cap configurable vía request, default 120 min (2h)
+            # Evita que wait_minutes grandes hagan eff_deadline negativo
+            MAX_WAIT_MINUTES = int(data.get("max_wait_minutes", 120))
             if wait_minutes > MAX_WAIT_MINUTES:
+                print(f"⚠️ wait_minutes={wait_minutes} capado a {MAX_WAIT_MINUTES} para {loc.get('identificador','?')}")
                 wait_minutes = MAX_WAIT_MINUTES
 
             opening_gap = loc.get("opening_gap")
@@ -761,7 +764,11 @@ def optimize():
                         if cl_gap < 0:
                             cl_gap = 0
 
-                        eff_deadline = int(extended_deadline[node]) - cl_gap - wait_here
+                        deadline_window = int(extended_deadline[node]) - cl_gap
+                        # Nunca restar más wait_here de lo que la ventana permite
+                        # Si wait_here > deadline_window, el nodo es irvisitable de todas formas
+                        wait_for_constraint = min(wait_here, max(0, deadline_window))
+                        eff_deadline = deadline_window - wait_for_constraint
                         ub = max(0, eff_deadline)
                         time_dimension.CumulVar(idx).SetRange(0, ub)
 
@@ -979,10 +986,9 @@ def optimize():
                     deadline_from_departure             = None
 
                     if deadline_rel is not None:
-                        # Mismo cálculo que en la constraint OR-Tools:
-                        # llegada + wait_for_deadline <= cierre - cl_gap
-                        # → llegada <= cierre - cl_gap - wait_for_deadline
-                        eff_deadline                  = int(deadline_rel) - cl_gap - wait_for_deadline
+                        deadline_window   = int(deadline_rel) - cl_gap
+                        wait_for_deadline = min(wait_for_deadline, max(0, deadline_window))
+                        eff_deadline      = deadline_window - wait_for_deadline
                         deadline_ub_eff               = max(0, eff_deadline)
                         deadline_from_departure       = eff_deadline - start_offset
                         latest_arrival_from_departure = deadline_ub_eff - start_offset

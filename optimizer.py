@@ -754,7 +754,7 @@ def optimize():
 
                     if extended_deadline[node] is not None:
                         cl_gap = max(0, int(extended_closing_gap[node] or 0))
-                        w1_ub  = max(0, int(extended_deadline[node]) - cl_gap)
+                        w1_ub  = max(0, int(extended_deadline[node]) - cl_gap - wait_here)  # arrival deadline
 
                     if extended_opening[node] is not None:
                         w1_open_real = int(extended_opening[node])
@@ -800,14 +800,17 @@ def optimize():
                         if cl_gap < 0:
                             cl_gap = 0
 
-                        eff_deadline = int(extended_deadline[node]) - cl_gap
+                        # El camión debe COMPLETAR el servicio antes de close_eff.
+                        # deadline_llegada = close_clock - closing_gap - service_time
+                        eff_deadline = int(extended_deadline[node]) - cl_gap - wait_here
                         ub = max(0, eff_deadline)
 
                         time_dimension.CumulVar(idx).SetRange(0, ub)
 
                         deadline_clock = _fmt_hhmm((reference_departure_minutes + eff_deadline) % (24 * 60))
+                        close_eff_display = _fmt_hhmm((reference_departure_minutes + int(extended_deadline[node]) - cl_gap) % (24 * 60))
                         print(f"📅 {loc_name} (ID {loc_id}): debe llegar antes de {deadline_clock} "
-                              f"(deadline={eff_deadline} min desde salida, gap={cl_gap} min)")
+                              f"(cierre_eff={close_eff_display}, gap={cl_gap} min, servicio={wait_here} min)")
 
                     if extended_opening[node] is not None:
                         opening_real = int(extended_opening[node])
@@ -1039,7 +1042,8 @@ def optimize():
                     deadline_from_departure = None
 
                     if deadline_rel is not None:
-                        eff_deadline = int(deadline_rel) - cl_gap
+                        # deadline de llegada = close - closing_gap - service_time
+                        eff_deadline = int(deadline_rel) - cl_gap - wait_here
                         deadline_ub_eff = max(0, eff_deadline) 
                         deadline_from_departure = eff_deadline - start_offset
                         latest_arrival_from_departure = deadline_ub_eff - start_offset
@@ -1072,7 +1076,7 @@ def optimize():
                         if extended_deadline[node] is not None:
                             close_abs        = reference_departure_minutes + extended_deadline[node]
                             close_clock      = _fmt_hhmm(close_abs)
-                            close_eff_clock  = _fmt_hhmm(close_abs - cl_gap)
+                            close_eff_clock  = _fmt_hhmm(close_abs - cl_gap - wait_here)  # arrival deadline = close - gap - service
 
                     opening_from_departure = None
                     closing_from_departure = None

@@ -157,7 +157,7 @@ def optimize():
         # CONFIGURACIÓN HARDCODEADA: tiempo máximo de espera por local (minutos).
         # No viene del JSON. Cambiar aquí si se necesita ajustar el límite global.
         # ─────────────────────────────────────────────────────────────────────
-        MAX_WAIT_MINUTES = 3000000
+        MAX_WAIT_MINUTES = 30
         max_wait_minutes_cap = float(MAX_WAIT_MINUTES)
 
         vehicle_departure_times_raw = data.get("vehicle_departure_times") or []
@@ -830,28 +830,38 @@ def optimize():
 
                     if extended_opening[node] is not None:
                         opening_real = int(extended_opening[node])
+                        arrival_var  = time_dimension.CumulVar(idx)
 
-                        arrival_var = time_dimension.CumulVar(idx)
-                        # CORRECCIÓN: el camión debe SALIR después de (apertura + servicio).
-                        # Si llega antes de que abra, espera idle hasta la apertura y recién
-                        # entonces hace el servicio. departure = arrival + SlackVar >= opening + wait.
-                        # La restricción anterior (arrival + wait >= opening) era incorrecta:
-                        # forzaba que el camión llegara ~wait min antes de la apertura y saliera
-                        # exactamente CUANDO abría, sin ejecutar el servicio post-apertura.
+                        op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
+
+                        # ── Restricción 1: llegada mínima ─────────────────────────────────
+                        # El camión no puede llegar antes de (apertura - opening_gap).
+                        # El opening_gap define desde cuándo puede estar en el muelle/cola.
+                        # Si opening - op_gap <= 0 (ventana comienza antes de la referencia),
+                        # no se aplica límite inferior (el camión puede llegar en cualquier momento).
+                        earliest_arrival_rel = opening_real - op_gap
+                        if earliest_arrival_rel > 0:
+                            solver.Add(
+                                arrival_var >= earliest_arrival_rel * routing.ActiveVar(idx)
+                            )
+
+                        # ── Restricción 2: salida mínima ──────────────────────────────────
+                        # El camión debe SALIR después de (apertura + servicio).
+                        # Si llega antes de que abra, espera idle y el servicio empieza
+                        # en la apertura. departure = arrival + SlackVar >= opening + wait.
                         solver.Add(
                             arrival_var + time_dimension.SlackVar(idx) >=
                             (opening_real + wait_here) * routing.ActiveVar(idx)
                         )
 
-                        op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
                         opening_clock          = _fmt_hhmm((reference_departure_minutes + opening_real) % (24 * 60))
                         earliest_arrival_clock = _fmt_hhmm((reference_departure_minutes + opening_real - op_gap) % (24 * 60))
                         earliest_departure_clock = _fmt_hhmm((reference_departure_minutes + opening_real + wait_here) % (24 * 60))
 
                         print(f"📍 {loc_name} (ID {loc_id}):")
-                        print(f"   ✓ Puede llegar desde las {earliest_arrival_clock} (gap={op_gap} min)")
-                        print(f"   ✓ Apertura real: {opening_clock}")
-                        print(f"   ✓ Salida mínima: {earliest_departure_clock} (apertura + {wait_here} min servicio)")
+                        print(f"   ✓ Llegada mínima: {earliest_arrival_clock} (gap={op_gap} min, {'aplicada' if earliest_arrival_rel > 0 else 'sin restricción'})")
+                        print(f"   ✓ Apertura real:  {opening_clock}")
+                        print(f"   ✓ Salida mínima:  {earliest_departure_clock} (apertura + {wait_here} min servicio)")
 
         def drive_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)

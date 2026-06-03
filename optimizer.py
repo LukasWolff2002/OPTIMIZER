@@ -157,7 +157,7 @@ def optimize():
         # CONFIGURACIÓN HARDCODEADA: tiempo máximo de espera por local (minutos).
         # No viene del JSON. Cambiar aquí si se necesita ajustar el límite global.
         # ─────────────────────────────────────────────────────────────────────
-        MAX_WAIT_MINUTES = 30
+        MAX_WAIT_MINUTES = 60
         max_wait_minutes_cap = float(MAX_WAIT_MINUTES)
 
         vehicle_departure_times_raw = data.get("vehicle_departure_times") or []

@@ -153,6 +153,13 @@ def optimize():
         HORIZON = int(data.get("max_time_per_trip", 480))
         reload_service_time = int(data.get("reload_service_time", 0))
 
+        # ─────────────────────────────────────────────────────────────────────
+        # CONFIGURACIÓN HARDCODEADA: tiempo máximo de espera por local (minutos).
+        # No viene del JSON. Cambiar aquí si se necesita ajustar el límite global.
+        # ─────────────────────────────────────────────────────────────────────
+        MAX_WAIT_MINUTES = 3000000
+        max_wait_minutes_cap = float(MAX_WAIT_MINUTES)
+
         vehicle_departure_times_raw = data.get("vehicle_departure_times") or []
         if not isinstance(vehicle_departure_times_raw, list):
             vehicle_departure_times_raw = []
@@ -275,9 +282,8 @@ def optimize():
 
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
-            MAX_WAIT_MINUTES = 1000000
-            if wait_minutes > MAX_WAIT_MINUTES:
-                wait_minutes = MAX_WAIT_MINUTES
+            if wait_minutes > max_wait_minutes_cap:
+                wait_minutes = max_wait_minutes_cap
 
             opening_gap = loc.get("opening_gap")
             closing_gap = loc.get("closing_gap")
@@ -754,7 +760,8 @@ def optimize():
 
                     if extended_deadline[node] is not None:
                         cl_gap = max(0, int(extended_closing_gap[node] or 0))
-                        w1_ub  = max(0, int(extended_deadline[node]) - cl_gap - wait_here)  # arrival deadline
+                        _w1_raw = int(extended_deadline[node]) - cl_gap - wait_here
+                        w1_ub  = max(0, _w1_raw if _w1_raw >= 0 else int(extended_deadline[node]) - cl_gap)  # arrival deadline
 
                     if extended_opening[node] is not None:
                         w1_open_real = int(extended_opening[node])
@@ -802,15 +809,24 @@ def optimize():
 
                         # El camión debe COMPLETAR el servicio antes de close_eff.
                         # deadline_llegada = close_clock - closing_gap - service_time
-                        eff_deadline = int(extended_deadline[node]) - cl_gap - wait_here
-                        ub = max(0, eff_deadline)
+                        close_eff_rel = int(extended_deadline[node]) - cl_gap
+                        eff_deadline  = close_eff_rel - wait_here
+                        close_eff_display = _fmt_hhmm((reference_departure_minutes + close_eff_rel) % (24 * 60))
 
-                        time_dimension.CumulVar(idx).SetRange(0, ub)
-
-                        deadline_clock = _fmt_hhmm((reference_departure_minutes + eff_deadline) % (24 * 60))
-                        close_eff_display = _fmt_hhmm((reference_departure_minutes + int(extended_deadline[node]) - cl_gap) % (24 * 60))
-                        print(f"📅 {loc_name} (ID {loc_id}): debe llegar antes de {deadline_clock} "
-                              f"(cierre_eff={close_eff_display}, gap={cl_gap} min, servicio={wait_here} min)")
+                        if eff_deadline > 0:
+                            # Caso normal: hay margen para llegar y hacer el servicio.
+                            time_dimension.CumulVar(idx).SetRange(0, eff_deadline)
+                            deadline_clock = _fmt_hhmm((reference_departure_minutes + eff_deadline) % (24 * 60))
+                            print(f"📅 {loc_name} (ID {loc_id}): llegada ≤ {deadline_clock} "
+                                  f"(cierre_eff={close_eff_display}, gap={cl_gap} min, servicio={wait_here} min)")
+                        else:
+                            # El tiempo de servicio es mayor que la ventana disponible.
+                            # No se aplica upper bound de llegada para evitar infactibilidad;
+                            # la restricción de salida (departure >= opening + wait) del bloque
+                            # siguiente se encarga de mantener la coherencia temporal.
+                            print(f"⚠️  {loc_name} (ID {loc_id}): servicio ({wait_here} min) ≥ "
+                                  f"ventana hasta cierre_eff={close_eff_display} ({close_eff_rel} min) "
+                                  f"— omitiendo upper bound de llegada")
 
                     if extended_opening[node] is not None:
                         opening_real = int(extended_opening[node])
@@ -1043,7 +1059,8 @@ def optimize():
 
                     if deadline_rel is not None:
                         # deadline de llegada = close - closing_gap - service_time
-                        eff_deadline = int(deadline_rel) - cl_gap - wait_here
+                        _raw_eff_ext = int(deadline_rel) - cl_gap - wait_here
+                        eff_deadline = _raw_eff_ext if _raw_eff_ext >= 0 else int(deadline_rel) - cl_gap
                         deadline_ub_eff = max(0, eff_deadline) 
                         deadline_from_departure = eff_deadline - start_offset
                         latest_arrival_from_departure = deadline_ub_eff - start_offset

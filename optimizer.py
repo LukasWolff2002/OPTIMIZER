@@ -1324,6 +1324,11 @@ def optimize():
                         int(timing.get("arrival_minutes_from_departure") or 0)
                         - (optimal_delay - current_delay)
                     )
+                    # Sincronizar cumul.time_from_departure con el valor fine-tuneado.
+                    # Sin esto, cumul queda con el valor raw (pre-fine-tuning) y difiere
+                    # de arrival_minutes_from_departure en las paradas post idle-wait.
+                    if d.get("cumul") is not None:
+                        d["cumul"]["time_from_departure"] = timing["arrival_minutes_from_departure"]
 
                     idle_wait    = int(timing.get("waiting_at_node_minutes") or 0)
                     service_time = int(timing.get("wait_minutes") or 0)  # fijo, no cambia

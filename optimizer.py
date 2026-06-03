@@ -813,16 +813,26 @@ def optimize():
                         opening_real = int(extended_opening[node])
 
                         arrival_var = time_dimension.CumulVar(idx)
-                        solver.Add(arrival_var + wait_here >= opening_real)
+                        # CORRECCIÓN: el camión debe SALIR después de (apertura + servicio).
+                        # Si llega antes de que abra, espera idle hasta la apertura y recién
+                        # entonces hace el servicio. departure = arrival + SlackVar >= opening + wait.
+                        # La restricción anterior (arrival + wait >= opening) era incorrecta:
+                        # forzaba que el camión llegara ~wait min antes de la apertura y saliera
+                        # exactamente CUANDO abría, sin ejecutar el servicio post-apertura.
+                        solver.Add(
+                            arrival_var + time_dimension.SlackVar(idx) >=
+                            (opening_real + wait_here) * routing.ActiveVar(idx)
+                        )
 
                         op_gap = int(extended_opening_gap[node]) if extended_opening_gap[node] is not None else 0
                         opening_clock          = _fmt_hhmm((reference_departure_minutes + opening_real) % (24 * 60))
                         earliest_arrival_clock = _fmt_hhmm((reference_departure_minutes + opening_real - op_gap) % (24 * 60))
+                        earliest_departure_clock = _fmt_hhmm((reference_departure_minutes + opening_real + wait_here) % (24 * 60))
 
                         print(f"📍 {loc_name} (ID {loc_id}):")
                         print(f"   ✓ Puede llegar desde las {earliest_arrival_clock} (gap={op_gap} min)")
-                        print(f"   ✓ No puede salir antes de {opening_clock} (apertura real)")
-                        print(f"   ✓ Tiempo de espera/descarga: {wait_here} min")
+                        print(f"   ✓ Apertura real: {opening_clock}")
+                        print(f"   ✓ Salida mínima: {earliest_departure_clock} (apertura + {wait_here} min servicio)")
 
         def drive_callback(from_index, to_index):
             from_node = manager.IndexToNode(from_index)
@@ -1007,17 +1017,20 @@ def optimize():
                     if cl_gap < 0: cl_gap = 0
 
                     arrival_from_departure = time_cumul - start_offset
-                    departure_from_departure = time_cumul + wait_here - start_offset
-
                     if arrival_from_departure < 0:
                         arrival_from_departure = 0
-                    if departure_from_departure < 0:
-                        departure_from_departure = 0
 
+                    # Calcular la espera idle ANTES del ETD: si el camión llega antes de que
+                    # abra el local, la espera empieza desde la llegada (no desde la apertura).
                     if extended_opening[node] is not None:
                         waiting_at_node_minutes = max(0, int(extended_opening[node]) - int(time_cumul))
                     else:
                         waiting_at_node_minutes = 0
+
+                    # ETD real = llegada + espera idle (por apertura) + tiempo de servicio
+                    departure_from_departure = time_cumul + waiting_at_node_minutes + wait_here - start_offset
+                    if departure_from_departure < 0:
+                        departure_from_departure = 0
 
                     deadline_rel = extended_deadline[node]          
                     deadline_ub_eff = None
@@ -1281,12 +1294,13 @@ def optimize():
                         - (optimal_delay - current_delay)
                     )
 
-                    wait_time     = int(timing.get("waiting_at_node_minutes") or 0)
-                    new_wait_time = max(0, wait_time - current_delay)
-                    unload_time   = int(timing.get("wait_minutes") or 0) - wait_time
-                    timing["waiting_at_node_minutes"] = new_wait_time
-                    timing["wait_minutes"]            = new_wait_time + unload_time
-                    current_delay                     = max(0, current_delay - wait_time)
+                    idle_wait    = int(timing.get("waiting_at_node_minutes") or 0)
+                    service_time = int(timing.get("wait_minutes") or 0)  # fijo, no cambia
+
+                    new_idle_wait = max(0, idle_wait - current_delay)
+                    timing["waiting_at_node_minutes"] = new_idle_wait
+                    timing["wait_minutes"]            = service_time  # el servicio siempre toma lo mismo
+                    current_delay                     = max(0, current_delay - idle_wait)
 
                     timing["etd_clock"] = _add_minutes_to_clock(timing.get("etd_clock"), current_delay)
                     timing["departure_minutes_from_departure"] = (
@@ -1365,4 +1379,3 @@ def optimize():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=3000, debug=False)
-    

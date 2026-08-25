@@ -1279,7 +1279,7 @@ def optimize():
         # ─────────────────────────────────────────────────────────────────────
         # POST-PROCESAMIENTO: MODOS + FINE-TUNING DE HORA DE SALIDA
         # ─────────────────────────────────────────────────────────────────────
-        SAFETY_MARGIN_MINUTES = 3000000
+        SAFETY_MARGIN_MINUTES = 30
 
         for vdata in vehicle_trips.values():
             modes_set = vdata.get("modes_used", set())

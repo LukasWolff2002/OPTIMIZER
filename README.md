@@ -31,6 +31,7 @@ OptimizerController#create
 | `multiplicador_tiempo` | Margen sobre los tiempos de viaje (tráfico) |
 | `limitar_espera` | **Nuevo.** `true` recorta la espera de cada local a `max_wait_minutes`; `false` usa la estimada real |
 | `max_wait_minutes` | **Nuevo.** Tope en minutos (por defecto 30) |
+| `max_departure_slack_minutes` | **Nuevo.** Cuánto puede el cálculo atrasar la hora de salida de un camión (0–720, por defecto 60). Con 0 sale exactamente a la hora pedida |
 | `fecha` | **Nuevo.** Fecha de la ruta. Sin ella se usaba la del servidor (UTC), y las reglas por día de la semana salían mal |
 | `max_time_per_trip` | Horizonte de conducción por camión. Por defecto 480 min — hoy la app **no lo envía** |
 | `job_id` | Id de la `OptimizerRequest`, para publicar el progreso en Redis |
@@ -40,6 +41,10 @@ OptimizerController#create
 **Éxito** (200): `status: "success"`, `assignments`, `totals`, `meta`, más
 `avisos` (cosas que conviene mirar: esperas recortadas, márgenes justos),
 `locales_sin_visita` y `log` (la bitácora completa).
+
+Cada asignación trae además, cuando el cálculo movió la salida:
+`departure_clock_solicitado` (la hora que se pidió), `departure_delay_minutes` y
+`departure_delay_motivo`. La app lo muestra como "pediste 07:00 · +35 min".
 
 **Fallo** (400): `status: "error"` con
 
@@ -106,14 +111,22 @@ with optimizer.app.test_client() as c:
 `data_input.json` trae un `curl` con un payload real de ejemplo (4 locales,
 2 camiones) del que se puede extraer el JSON.
 
+## Puntos críticos y plan de mejora
+
+El desarrollo completo —qué falla, por qué importa y qué proponemos hacer, con
+orden sugerido— está en [`docs/PUNTOS_CRITICOS.md`](docs/PUNTOS_CRITICOS.md).
+Resumen de lo más urgente: `gunicorn -w 32` en un contenedor acotado, el endpoint
+sin autenticación, y que un camión con `palets = 0` desactiva la restricción de
+palets en silencio.
+
 ## Puntos que conviene tener presentes
 
 - **Todos los locales son obligatorios.** No hay disyunciones en la corrida real:
   si un solo local es imposible, no hay ruta. Por eso el diagnóstico las usa
   para señalarlo.
-- **Cada camión se modela como 3 vehículos virtuales** (modo libre / Walmart /
-  Cencosud) con la restricción de que sólo uno puede estar activo. El modelo es
-  3× más grande de lo que sugiere la flota.
+- **Los vehículos virtuales se generan por grupo presente** (`modos_necesarios`):
+  una ruta sin locales de Walmart no crea el modo Walmart. Antes eran siempre 3
+  por camión. Medido: misma ruta y mismo tiempo, ~10–17% menos memoria del modelo.
 - **`max_trips_per_vehicle = 1`**: el código soporta varios viajes por camión
   (`costo_reingreso_valor`, `reload_service_time`) pero está desactivado.
 - **`number_of_workers` no existe en OR-Tools 9.x**: la búsqueda es de un hilo.

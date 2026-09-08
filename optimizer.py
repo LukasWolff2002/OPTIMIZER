@@ -212,6 +212,46 @@ def _nombre_local(loc, idx=None):
 # Revisiones ANTES de resolver: lo que se puede descartar sin el solver
 # ---------------------------------------------------------------------
 
+# Grupo excluyente de un local. Walmart y Cencosud no comparten viaje con otros
+# clientes, y cada camión sólo puede atender UN grupo por viaje.
+#
+# Está a nivel de módulo porque hace falta ANTES de armar la flota virtual, para
+# saber qué modos se necesitan de verdad (ver `modos_necesarios`).
+def _group(identificador: str) -> str:
+    ident = (identificador or "").upper()
+    if "WALMART CD" in ident:
+        return "WALMART"
+    if "CENCOSUD CD" in ident:
+        return "CENCOSUD"
+    return "OTHER"
+
+
+def modos_necesarios(locations, modo_free, modo_w, modo_c):
+    """Qué modos hacen falta para ESTA solicitud.
+
+    Cada camión se modelaba siempre como tres vehículos virtuales (libre,
+    Walmart, Cencosud) aunque la ruta no tuviera un solo local de esos grupos:
+    el modelo era 3× más grande de lo necesario y el solver gastaba su tiempo
+    descartando vehículos que nunca podían usarse.
+
+    Un modo sólo se necesita si hay locales que lo exijan:
+      · Walmart  → hay locales del grupo WALMART
+      · Cencosud → hay locales del grupo CENCOSUD
+      · libre    → hay locales del resto
+    (los locales de La Vega admiten libre o Cencosud, así que no obligan a
+    ninguno de los dos por sí solos.)
+    """
+    grupos = {_group(loc.get("identificador", "")) for loc in locations[1:]}
+    modos = []
+    if "OTHER" in grupos:
+        modos.append(modo_free)
+    if "WALMART" in grupos:
+        modos.append(modo_w)
+    if "CENCOSUD" in grupos:
+        modos.append(modo_c)
+    return tuple(modos) or (modo_free,), grupos
+
+
 def revisar_estructura(data, truck_ids, diag):
     """Valida que el JSON traiga lo mínimo y con la forma correcta.
 
@@ -554,8 +594,14 @@ def _motivo_probable_del_descarte(i, ctx):
     return "no encaja junto con el resto de las paradas dentro de los tiempos disponibles"
 
 
-def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intento=8):
-    """Identifica QUÉ restricción bloquea la ruta y devuelve un ErrorOptimizacion."""
+def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intento=8,
+                                estado_solver=None, tiempo_calculo=None):
+    """Identifica QUÉ restricción bloquea la ruta y devuelve un ErrorOptimizacion.
+
+    `estado_solver` sirve para el caso en que NINGUNA restricción explique el
+    fallo: si además se agotó el tiempo, lo más probable es que el problema sea
+    grande y no imposible.
+    """
 
     diag.info("DIAGNOSTICO_INICIO",
               "No hubo solución: probando qué restricción la impide "
@@ -635,7 +681,28 @@ def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intent
             )
         diag.info(f"DIAGNOSTICO_{codigo}", f"Soltar «{clave}» tampoco alcanza.")
 
-    # ── Paso 3: ni relajando una sola cosa ────────────────────────────────
+    # ── Paso 3: ninguna restricción por sí sola lo explica ────────────────
+    # Si además se acabó el tiempo, el diagnóstico honesto es "es grande", no
+    # "es imposible": son problemas con soluciones opuestas.
+    if estado_solver == routing_enums_pb2.RoutingSearchStatus.ROUTING_FAIL_TIMEOUT:
+        minutos = max(1, int(round((tiempo_calculo or 0) / 60)))
+        return ErrorOptimizacion(
+            "TIEMPO_DE_CALCULO_INSUFICIENTE",
+            "Se acabó el tiempo de cálculo antes de encontrar una ruta.",
+            detalle=[
+                f"Se usaron {minutos} min de cálculo para {ctx['num_nodes'] - 1} paradas "
+                f"y {ctx['base_num_vehicles']} camión(es).",
+                "Se probó soltando cada restricción por separado y ninguna destraba el cálculo "
+                "por sí sola, así que no parece haber una condición imposible: el problema es "
+                "grande y no alcanzó el tiempo.",
+            ],
+            sugerencias=[
+                "Sube el 'Tiempo de cálculo' en los ajustes del algoritmo.",
+                "O divide la carga en dos optimizaciones con menos locales.",
+            ],
+            datos={"solver_status": int(estado_solver)},
+        )
+
     return ErrorOptimizacion(
         "SIN_SOLUCION",
         "No se encontró ninguna ruta que cumpla las restricciones, y no hay una sola causa.",
@@ -759,6 +826,21 @@ def optimize():
         max_wait_minutes_cap = max_wait_minutes_cfg if limitar_espera else float("inf")
         esperas_recortadas = []
 
+        # ─────────────────────────────────────────────────────────────────────
+        # HOLGURA DE LA HORA DE SALIDA (minutos)
+        # ─────────────────────────────────────────────────────────────────────
+        # La hora de salida que se elige por camión es un compromiso operativo
+        # (turnos, carga), no una sugerencia. El modelo la trataba como un piso
+        # con 12 HORAS de holgura, y encima el ajuste fino posterior la corría
+        # más: alguien ponía 07:00 y podía recibir una ruta que sale mucho
+        # después, sin que nada lo explicara. Ahora el margen lo decide quien
+        # arma la ruta y el resultado dice cuánto se movió y por qué.
+        try:
+            max_departure_slack = int(float(data.get("max_departure_slack_minutes", 60)))
+        except Exception:
+            return jsonify(error="max_departure_slack_minutes debe ser un número"), 400
+        max_departure_slack = max(0, min(max_departure_slack, 12 * 60))
+
         vehicle_departure_times_raw = data.get("vehicle_departure_times") or []
         if not isinstance(vehicle_departure_times_raw, list):
             vehicle_departure_times_raw = []
@@ -821,7 +903,16 @@ def optimize():
         MODE_FREE = 0
         MODE_W    = 1
         MODE_C    = 2
-        MODES = (MODE_FREE, MODE_W, MODE_C)
+
+        # Sólo los modos que esta solicitud necesita: con rutas de un solo grupo
+        # el modelo pasa de 3 vehículos virtuales por camión a 1.
+        MODES, _grupos_presentes = modos_necesarios(locations, MODE_FREE, MODE_W, MODE_C)
+        _nombres_modo = {MODE_FREE: "libre", MODE_W: "Walmart", MODE_C: "Cencosud"}
+        diag.info("FLOTA_VIRTUAL",
+                  f"Grupos en la ruta: {', '.join(sorted(_grupos_presentes))}. "
+                  f"Modos activos: {', '.join(_nombres_modo[m] for m in MODES)} "
+                  f"→ {base_num_vehicles * len(MODES)} vehículos en el modelo "
+                  f"(antes siempre {base_num_vehicles * 3}).")
 
         vehicle_capacities, vehicle_consume, vehicle_free, vehicle_palets = [], [], [], []
         vehicle_mapping, vehicle_trip_no, vehicle_mode = {}, {}, {}
@@ -860,14 +951,6 @@ def optimize():
         extended_closing_gap = [0]        
         extended_refrigerate = [False]    
         split_mapping        = {}         
-
-        def _group(identificador: str) -> str:
-            ident = (identificador or "").upper()
-            if "WALMART CD" in ident:
-                return "WALMART"
-            if "CENCOSUD CD" in ident:
-                return "CENCOSUD"
-            return "OTHER"
 
         for idx_loc, loc in enumerate(locations[1:], start=1):
             prod_quantities = {
@@ -1433,11 +1516,10 @@ def optimize():
                                   f"({_fmt_hhmm(dep_abs)} salió antes que referencia {_fmt_hhmm(reference_departure_minutes)})")
                     start_idx = routing.Start(v)
                     effective_start = max(0, offset)
-                    MAX_DEPARTURE_SLACK = 720  # 12h máximo de retraso posible
 
                     time_dimension.CumulVar(start_idx).SetRange(
                         effective_start,
-                        effective_start + MAX_DEPARTURE_SLACK
+                        effective_start + max_departure_slack
                     )
                     vehicle_start_offsets[v] = offset 
             else:
@@ -1709,28 +1791,20 @@ def optimize():
             # `status()` distingue "no existe ruta posible" de "se acabó el
             # tiempo de cálculo", que son dos problemas con soluciones opuestas.
             estado_solver = routing.status()
+            _nombres_estado = {0: "no resuelto", 1: "éxito", 2: "óptimo local no alcanzado",
+                               3: "sin solución", 4: "sin solución y se acabó el tiempo",
+                               5: "modelo inválido", 6: "infactible", 7: "óptimo"}
             diag.error("SOLVER_SIN_SOLUCION",
-                       f"El solver terminó sin solución (status={estado_solver}).")
-
-            if estado_solver == routing_enums_pb2.RoutingSearchStatus.ROUTING_FAIL_TIMEOUT:
-                raise ErrorOptimizacion(
-                    "TIEMPO_DE_CALCULO_INSUFICIENTE",
-                    "Se acabó el tiempo de cálculo antes de encontrar una ruta.",
-                    detalle=[
-                        f"Se usaron {max(1, int(round(tiempo_calculo / 60)))} min de cálculo para "
-                        f"{num_nodes - 1} paradas y {base_num_vehicles} camión(es).",
-                        "No significa que la ruta sea imposible: el problema es grande y no alcanzó el tiempo.",
-                    ],
-                    sugerencias=[
-                        "Sube el 'Tiempo de cálculo' en los ajustes del algoritmo.",
-                        "O divide la carga en dos optimizaciones con menos locales.",
-                    ],
-                    datos={"solver_status": int(estado_solver)},
-                )
+                       f"El solver terminó sin solución: {_nombres_estado.get(estado_solver, estado_solver)}.")
 
             update_job_status(job_id, "optimizando",
                               "No hubo solución: analizando qué restricción la impide...", 80)
-            raise diagnosticar_infactibilidad(construir_modelo, ctx, diag)
+            # Presupuesto del diagnóstico: proporcional al del cálculo, acotado.
+            _seg_diag = int(max(8, min(30, tiempo_calculo / 4)))
+            raise diagnosticar_infactibilidad(construir_modelo, ctx, diag,
+                                              segundos_por_intento=_seg_diag,
+                                              estado_solver=estado_solver,
+                                              tiempo_calculo=tiempo_calculo)
 
         update_job_status(job_id, "procesando_resultados", "Ruta definitiva calculada. Extrayendo itinerarios...", 90)
 
@@ -2002,9 +2076,25 @@ def optimize():
             )
             trip_duration_minutes = return_minutes_from_departure
 
+            # Hora de salida pedida por el usuario para ESTE camión, y cuánto la
+            # movió el solver. El ajuste fino de más abajo puede moverla más,
+            # pero el total nunca supera `max_departure_slack`.
+            _salida_pedida_rel = vehicle_start_offsets_base[main_vehicle] if reference_departure_minutes is not None else 0
+            _salida_pedida_clock = (_fmt_hhmm(reference_departure_minutes + _salida_pedida_rel)
+                                    if reference_departure_minutes is not None else None)
+            _retraso_solver = max(0, int(start_offset) - int(_salida_pedida_rel))
+
             agg = vehicle_trips.setdefault(main_vehicle, {
                 "vehicle": main_vehicle,
-                "departure_clock": departure_clock_v,   
+                "departure_clock": departure_clock_v,
+                "departure_clock_solicitado": _salida_pedida_clock,
+                "departure_delay_minutes": _retraso_solver,
+                "departure_delay_motivo": (
+                    f"el cálculo atrasó la salida {_retraso_solver} min para calzar con los "
+                    f"horarios de atención de los locales"
+                    if _retraso_solver > 0 else None
+                ),
+                "max_departure_slack_minutes": max_departure_slack,
                 "trips": [],
                 "total_distance": 0.0,
                 "total_fuel_liters": 0.0,
@@ -2085,13 +2175,32 @@ def optimize():
                 max_valid_delay = min(deadline_slacks)
                 optimal_delay   = max(0, max_valid_delay - SAFETY_MARGIN_MINUTES)
 
+                # El retraso TOTAL respecto de la hora pedida (lo que ya movió el
+                # solver + lo que mueve este ajuste) no puede pasar del margen
+                # que autorizó el usuario.
+                _ya_movido = int(vdata.get("departure_delay_minutes") or 0)
+                _margen_restante = max(0, int(vdata.get("max_departure_slack_minutes") or 0) - _ya_movido)
+                optimal_delay = min(optimal_delay, _margen_restante)
+
                 if optimal_delay <= 0:
                     continue
+
+                # Cuánta espera ociosa se ahorra al salir más tarde: es la razón
+                # por la que se mueve la salida, y hay que poder explicarla.
+                _espera_ociosa = sum(int(d.get("timing", {}).get("waiting_at_node_minutes") or 0)
+                                     for d in deliveries)
 
                 # Sobreescribir hora de salida
                 new_dep_clock          = _add_minutes_to_clock(vdata.get("departure_clock"), optimal_delay)
                 vdata["departure_clock"] = new_dep_clock
                 trip["departure_clock"]  = new_dep_clock
+                vdata["departure_delay_minutes"] = _ya_movido + optimal_delay
+                vdata["departure_delay_motivo"] = (
+                    f"se atrasó la salida {_ya_movido + optimal_delay} min para no esperar "
+                    f"{min(_espera_ociosa, optimal_delay)} min detenido en el primer local"
+                    if _espera_ociosa > 0 else
+                    f"se atrasó la salida {_ya_movido + optimal_delay} min para llegar más ajustado a los horarios"
+                )
 
                 current_delay = optimal_delay
 
@@ -2179,6 +2288,7 @@ def optimize():
                 "max_stops_per_vehicle": maximo_de_paradas,
                 "time_multiplier": multiplicador_tiempo,
                 "reload_service_time_minutes": reload_service_time,
+                "max_departure_slack_minutes": max_departure_slack,
                 "limitar_espera": bool(limitar_espera),
                 "max_wait_minutes": (max_wait_minutes_cfg if limitar_espera else None),
                 "esperas_recortadas": len(esperas_recortadas),

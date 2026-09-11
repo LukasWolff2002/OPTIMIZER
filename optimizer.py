@@ -1,13 +1,10 @@
-from flask import Flask, Response, request, jsonify
+from flask import Flask, request, jsonify
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import copy
 import os
 import json
-import queue
 import redis
-import threading
 import time
-import uuid
 from datetime import datetime
 
 app = Flask(__name__)
@@ -34,62 +31,28 @@ if redis_url:
 else:
     print("⚠️ ADVERTENCIA: Variable REDIS_URL no configurada.")
 
-# Oyentes de progreso por job_id. Los registra /optimize/stream para mandar el
-# progreso por la MISMA conexión HTTP en que después va el resultado. Redis sólo
-# llegaba a la app si ambos servicios compartían la misma instancia (y la app
-# además tenía que poder conectarse a ella con TLS), cosa que casi nunca se
-# cumplía: la pantalla "Procesando" quedaba en "Enviando datos..." hasta el final.
-_oyentes_progreso = {}
-_oyentes_lock = threading.Lock()
-
-
-def _registrar_oyente(job_id, oyente):
-    with _oyentes_lock:
-        _oyentes_progreso[str(job_id)] = oyente
-
-
-def _quitar_oyente(job_id):
-    with _oyentes_lock:
-        _oyentes_progreso.pop(str(job_id), None)
-
-
 def update_job_status(job_id: str, status: str, message: str, progress: int,
-                     detalle=None, codigo=None, sugerencias=None, **extra):
-    """Publica el progreso: al oyente de la conexión (si la hay) y en Redis (si
-    está configurado). Falla en silencio para no quebrar el optimizador.
+                     detalle=None, codigo=None, sugerencias=None):
+    """Guarda el progreso en Redis. Falla silenciosamente para no quebrar el optimizador.
 
     `detalle`, `codigo` y `sugerencias` viajan hasta la pantalla de "Procesando"
     de la app: sin ellos, un fallo sólo se veía como "Error en la optimización".
-    `extra` lleva las cifras de la búsqueda (mejoras, camiones, km, paradas,
-    segundos transcurridos y tope) para que la pantalla muestre algo real.
     """
-    if not job_id:
-        return
-    estado = {
-        "status": status,
-        "message": message,
-        "progress": progress,
-        "updated_at": datetime.utcnow().isoformat()
-    }
-    if detalle:
-        estado["detalle"] = list(detalle)[:20]
-    if codigo:
-        estado["error_code"] = codigo
-    if sugerencias:
-        estado["sugerencias"] = list(sugerencias)[:10]
-    estado.update({k: v for k, v in extra.items() if v is not None})
-
-    with _oyentes_lock:
-        oyente = _oyentes_progreso.get(str(job_id))
-    if oyente:
-        try:
-            oyente(dict(estado))
-        except Exception as e:
-            print(f"Error avisando progreso: {e}")
-
-    if not redis_client:
+    if not job_id or not redis_client:
         return
     try:
+        estado = {
+            "status": status,
+            "message": message,
+            "progress": progress,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        if detalle:
+            estado["detalle"] = list(detalle)[:20]
+        if codigo:
+            estado["error_code"] = codigo
+        if sugerencias:
+            estado["sugerencias"] = list(sugerencias)[:10]
         redis_client.setex(f"opt_status_{job_id}", 3600, json.dumps(estado))
     except Exception as e:
         print(f"Error escribiendo en Redis: {e}")
@@ -451,38 +414,6 @@ def revisar_factibilidad(ctx, diag):
                    "camiones": ctx["base_num_vehicles"]},
         ))
 
-    # ── Refrigerados vs grupos ────────────────────────────────────────────
-    # Cada camión atiende UN grupo por viaje (Walmart, Cencosud o el resto), y
-    # sólo un refrigerado puede llevar a un local que exige frío. Si los locales
-    # que exigen frío forman más grupos que refrigerados hay, uno queda sin
-    # camión. Antes esto terminaba en "no encaja junto con el resto de las
-    # paradas", que no dice nada: pasó con Walmart + Cencosud + Jumbo y dos
-    # refrigerados (el tercero de la flota era de carga seca).
-    if nodos_refrigerados:
-        camiones_refri = [i for i, f in enumerate(ctx["vehicle_free_base"]) if f]
-        grupos_frio = {}
-        for i in nodos_refrigerados:
-            grupos_frio.setdefault(ctx["node_group"][i], set()).add(_nombre_local(ctx["extended_locations"][i], i))
-        if camiones_refri and len(grupos_frio) > len(camiones_refri):
-            etiquetas = {"WALMART": "Walmart CD", "CENCOSUD": "Cencosud CD", "OTHER": "el resto de los clientes"}
-            faltan = len(grupos_frio) - len(camiones_refri)
-            problemas.append(ErrorOptimizacion(
-                "REFRIGERADOS_INSUFICIENTES_POR_GRUPO",
-                "Faltan camiones refrigerados: los locales que exigen frío no pueden ir todos juntos.",
-                detalle=[
-                    "Walmart y Cencosud no comparten camión con otros clientes, y cada camión "
-                    "atiende un solo grupo por viaje: cada grupo que exige frío necesita su propio refrigerado.",
-                    f"Refrigerados seleccionados: {len(camiones_refri)} de {len(ctx['vehicle_free_base'])} camiones. "
-                    f"Grupos que exigen frío: {len(grupos_frio)}.",
-                ] + [f"{etiquetas.get(g, g)}: {', '.join(sorted(n))}." for g, n in sorted(grupos_frio.items())],
-                sugerencias=[
-                    f"Selecciona {faltan} camión(es) refrigerado(s) más.",
-                    "O deja los locales de uno de esos grupos para otra ruta.",
-                ],
-                datos={"grupos_frio": {g: sorted(n) for g, n in grupos_frio.items()},
-                       "refrigerados": len(camiones_refri)},
-            ))
-
     # ── Máximo de paradas ─────────────────────────────────────────────────
     paradas_necesarias = ctx["num_nodes"] - 1
     paradas_posibles = ctx["maximo_de_paradas"] * ctx["base_num_vehicles"]
@@ -675,8 +606,6 @@ def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intent
     diag.info("DIAGNOSTICO_INICIO",
               "No hubo solución: probando qué restricción la impide "
               f"({segundos_por_intento}s por prueba).")
-    update_job_status(diag.job_id, "diagnosticando",
-                      "No hubo ruta posible: buscando qué locales no se pueden atender...", 82)
 
     # ── Paso 1: ¿qué locales son los imposibles? ──────────────────────────
     # Con disyunciones el solver puede dejar locales fuera pagando una multa.
@@ -730,10 +659,7 @@ def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intent
             )
 
     # ── Paso 2: soltar una restricción a la vez ───────────────────────────
-    for n_prueba, (clave, codigo, mensaje, sugerencias) in enumerate(RELAJACIONES, start=1):
-        update_job_status(diag.job_id, "diagnosticando",
-                          f"Buscando la causa: probando sin «{clave}» ({n_prueba} de {len(RELAJACIONES)})...",
-                          84 + int(12 * n_prueba / len(RELAJACIONES)))
+    for clave, codigo, mensaje, sugerencias in RELAJACIONES:
         try:
             modelo = construir_modelo(relajar=frozenset([clave]), silencioso=True)
             sol = modelo["routing"].SolveWithParameters(_parametros_rapidos(segundos_por_intento))
@@ -1800,8 +1726,7 @@ def optimize():
 
 
         # ------------------------ Resolución del modelo ----------------------------
-        update_job_status(job_id, "buscando", "Buscando la primera ruta posible...", 50,
-                          limite_s=tiempo_calculo, t=0)
+        update_job_status(job_id, "optimizando", "Buscando la primera ruta factible (esto puede tomar un momento)...", 50)
         
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = (
@@ -1838,35 +1763,12 @@ def optimize():
 
             INTERVALO_SEGUNDOS = 2.0
 
-            def __init__(self, routing_model, current_job_id, manager_model, distancias, limite_s):
+            def __init__(self, routing_model, current_job_id):
                 self.routing = routing_model
-                self.manager = manager_model
-                self.distancias = distancias
                 self.job_id = current_job_id
-                self.limite_s = limite_s
                 self.best_cost = float('inf')
                 self.mejoras = 0
                 self.ultimo_aviso = 0.0
-                self.inicio = time.monotonic()
-
-            def cifras(self):
-                """Camiones, paradas y km de la solución que se acaba de encontrar."""
-                camiones, paradas, km = 0, 0, 0.0
-                for v in range(self.routing.vehicles()):
-                    idx = self.routing.Start(v)
-                    siguiente = self.routing.NextVar(idx).Value()
-                    if self.routing.IsEnd(siguiente):
-                        continue
-                    camiones += 1
-                    while not self.routing.IsEnd(idx):
-                        siguiente = self.routing.NextVar(idx).Value()
-                        a = self.manager.IndexToNode(idx)
-                        b = self.manager.IndexToNode(siguiente)
-                        km += float(self.distancias[a][b] or 0)
-                        if b != 0:
-                            paradas += 1
-                        idx = siguiente
-                return camiones, paradas, round(km, 1)
 
             def __call__(self):
                 cost = self.routing.CostVar().Min()
@@ -1875,24 +1777,13 @@ def optimize():
                 self.best_cost = cost
                 self.mejoras += 1
                 ahora = time.monotonic()
-                # La primera solución se informa siempre: es el salto de "buscando"
-                # a "mejorando". Las siguientes, como mucho cada 2 segundos.
-                if self.mejoras > 1 and ahora - self.ultimo_aviso < self.INTERVALO_SEGUNDOS:
+                if ahora - self.ultimo_aviso < self.INTERVALO_SEGUNDOS:
                     return
                 self.ultimo_aviso = ahora
-                try:
-                    camiones, paradas, km = self.cifras()
-                except Exception:
-                    camiones = paradas = km = None
-                t = round(ahora - self.inicio, 1)
-                avance = min(1.0, t / self.limite_s) if self.limite_s else 0
-                texto = ("Primera ruta encontrada; ahora se busca una mejor..." if self.mejoras == 1
-                         else f"Mejorando la ruta ({self.mejoras} mejoras encontradas)...")
-                update_job_status(self.job_id, "mejorando", texto, 50 + int(40 * avance),
-                                  mejoras=self.mejoras, camiones=camiones, paradas=paradas,
-                                  km=km, t=t, limite_s=self.limite_s)
+                update_job_status(self.job_id, "optimizando",
+                                  f"Mejorando la ruta ({self.mejoras} mejoras encontradas)...", 75)
 
-        monitor = RoutingMonitor(routing, job_id, manager, extended_distance_matrix, tiempo_calculo)
+        monitor = RoutingMonitor(routing, job_id)
         routing.AddAtSolutionCallback(monitor)
 
         solution = routing.SolveWithParameters(search_parameters)
@@ -2467,83 +2358,6 @@ def optimize():
         }), 500
 
 # ---------------------------------------------------------------------
-# Progreso en vivo por la misma conexión
-# ---------------------------------------------------------------------
-#
-# Mismo cálculo que /optimize, pero la respuesta es NDJSON (una línea JSON por
-# evento) y va llegando mientras se calcula:
-#   {"tipo": "inicio",    "job_id": ...}
-#   {"tipo": "progreso",  "etapa", "mensaje", "porcentaje", + cifras de la búsqueda}
-#   {"tipo": "latido",    "t": segundos}            ← cada 5 s sin novedades
-#   {"tipo": "resultado", "http": 200|400|500, "cuerpo": <lo que devuelve /optimize>}
-# El latido mantiene viva la conexión a través de los proxies durante los
-# minutos de cálculo en que el solver no informa nada.
-
-LATIDO_SEGUNDOS = 5
-
-
-def _linea(evento):
-    return json.dumps(evento, ensure_ascii=False) + "\n"
-
-
-@app.route("/optimize/stream", methods=["POST"])
-def optimize_stream():
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify(error="No se recibió JSON válido"), 400
-
-    datos = payload[0] if isinstance(payload, list) and payload else payload
-    if not isinstance(datos, dict):
-        return jsonify(error="Se esperaba [data, truck_ids, user_id]"), 400
-    job_id = str(datos.get("job_id") or uuid.uuid4().hex)
-    datos["job_id"] = job_id
-
-    cola = queue.Queue()
-    _registrar_oyente(job_id, lambda estado: cola.put(("progreso", estado)))
-
-    def calcular():
-        # optimize() lee `request`: se le da un contexto propio con el mismo JSON.
-        try:
-            with app.test_request_context("/optimize", method="POST", json=payload):
-                respuesta = optimize()
-                if isinstance(respuesta, tuple):
-                    cuerpo, codigo = respuesta[0], respuesta[1]
-                else:
-                    cuerpo, codigo = respuesta, 200
-                cola.put(("fin", cuerpo.get_json(silent=True) or {}, int(codigo)))
-        except Exception as e:
-            cola.put(("fin", {"status": "error", "error": f"Error interno del optimizador: {e}",
-                              "error_code": "ERROR_INTERNO"}, 500))
-
-    threading.Thread(target=calcular, name=f"optimizar-{job_id}", daemon=True).start()
-
-    def eventos():
-        inicio = time.monotonic()
-        try:
-            yield _linea({"tipo": "inicio", "job_id": job_id})
-            while True:
-                try:
-                    tipo, *resto = cola.get(timeout=LATIDO_SEGUNDOS)
-                except queue.Empty:
-                    yield _linea({"tipo": "latido", "t": round(time.monotonic() - inicio, 1)})
-                    continue
-                if tipo == "fin":
-                    cuerpo, codigo = resto
-                    yield _linea({"tipo": "resultado", "http": codigo, "cuerpo": cuerpo})
-                    return
-                estado = resto[0]
-                evento = {"tipo": "progreso", "etapa": estado.pop("status", None),
-                          "mensaje": estado.pop("message", None),
-                          "porcentaje": estado.pop("progress", None)}
-                estado.pop("updated_at", None)
-                evento.update(estado)
-                yield _linea(evento)
-        finally:
-            _quitar_oyente(job_id)
-
-    return Response(eventos(), mimetype="application/x-ndjson",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=3000, debug=False)

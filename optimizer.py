@@ -414,6 +414,38 @@ def revisar_factibilidad(ctx, diag):
                    "camiones": ctx["base_num_vehicles"]},
         ))
 
+    # ── Refrigerados vs grupos ────────────────────────────────────────────
+    # Cada camión atiende UN grupo por viaje (Walmart, Cencosud o el resto), y
+    # sólo un refrigerado puede llevar a un local que exige frío. Si los locales
+    # que exigen frío forman más grupos que refrigerados hay, uno queda sin
+    # camión. Antes esto terminaba en "no encaja junto con el resto de las
+    # paradas", que no dice nada: pasó con Walmart + Cencosud + Jumbo y dos
+    # refrigerados (el tercero de la flota era de carga seca).
+    if nodos_refrigerados:
+        camiones_refri = [i for i, f in enumerate(ctx["vehicle_free_base"]) if f]
+        grupos_frio = {}
+        for i in nodos_refrigerados:
+            grupos_frio.setdefault(ctx["node_group"][i], set()).add(_nombre_local(ctx["extended_locations"][i], i))
+        if camiones_refri and len(grupos_frio) > len(camiones_refri):
+            etiquetas = {"WALMART": "Walmart CD", "CENCOSUD": "Cencosud CD", "OTHER": "el resto de los clientes"}
+            faltan = len(grupos_frio) - len(camiones_refri)
+            problemas.append(ErrorOptimizacion(
+                "REFRIGERADOS_INSUFICIENTES_POR_GRUPO",
+                "Faltan camiones refrigerados: los locales que exigen frío no pueden ir todos juntos.",
+                detalle=[
+                    "Walmart y Cencosud no comparten camión con otros clientes, y cada camión "
+                    "atiende un solo grupo por viaje: cada grupo que exige frío necesita su propio refrigerado.",
+                    f"Refrigerados seleccionados: {len(camiones_refri)} de {len(ctx['vehicle_free_base'])} camiones. "
+                    f"Grupos que exigen frío: {len(grupos_frio)}.",
+                ] + [f"{etiquetas.get(g, g)}: {', '.join(sorted(n))}." for g, n in sorted(grupos_frio.items())],
+                sugerencias=[
+                    f"Selecciona {faltan} camión(es) refrigerado(s) más.",
+                    "O deja los locales de uno de esos grupos para otra ruta.",
+                ],
+                datos={"grupos_frio": {g: sorted(n) for g, n in grupos_frio.items()},
+                       "refrigerados": len(camiones_refri)},
+            ))
+
     # ── Máximo de paradas ─────────────────────────────────────────────────
     paradas_necesarias = ctx["num_nodes"] - 1
     paradas_posibles = ctx["maximo_de_paradas"] * ctx["base_num_vehicles"]

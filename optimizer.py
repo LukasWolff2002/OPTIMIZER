@@ -263,6 +263,87 @@ def _group(identificador: str) -> str:
     return "OTHER"
 
 
+def _es_la_vega(identificador: str) -> bool:
+    # La misma regla que `is_lv_node` en construir_modelo.
+    return "LA VEGA" in (identificador or "").upper()
+
+
+# ── Zonas (pedido del usuario, 13-10-2026) ─────────────────────────────────
+# Con «mezclar_zonas» en falso, un camión que lleva algo a un local de la
+# Región Metropolitana solo reparte a locales de la Región Metropolitana: los
+# de otras zonas (Quinta Región, Zona Sur, sin zona) van en otro camión. Es de
+# la Región Metropolitana todo local cuya zona dice METROPOLITANA («REGION
+# METROPOLITANA», «… ZONA ORIENTE», «… ZONA PONIENTE», «… ZONA SUR»). El
+# packing (el depósito) no cuenta.
+ZONA_METRO = "METRO"
+ZONA_OTRA = "OTRA"
+ZONA_ETIQUETAS = {ZONA_METRO: "Región Metropolitana", ZONA_OTRA: "otras zonas"}
+
+
+def _zona_clase(zona) -> str:
+    return ZONA_METRO if "METROPOLITANA" in str(zona or "").upper() else ZONA_OTRA
+
+
+def _leer_bool(valor, por_defecto):
+    """true/false del JSON, o «1»/«0» y «true»/«false» como texto."""
+    if valor is None:
+        return por_defecto
+    return bool(valor) and str(valor).strip().lower() not in ("false", "0", "")
+
+
+def _etiqueta_grupo(g, resto="el resto de los locales"):
+    """Nombre de un grupo de `_grupos_por_camion` para los mensajes."""
+    etiquetas = {"WALMART": "Walmart CD", "CENCOSUD": "Cencosud CD", "OTHER": resto}
+    if isinstance(g, tuple):
+        grupo, zona = g
+        return f"{etiquetas.get(grupo, grupo)} ({ZONA_ETIQUETAS.get(zona, zona)})"
+    return etiquetas.get(g, g)
+
+
+def _grupos_por_camion(nodos):
+    """Grupos de locales que necesitan cada uno su propio camión, con sus nodos.
+
+    `nodos` es [(índice, identificador)] o, si no se mezclan zonas,
+    [(índice, identificador, zona)]: entonces el mismo reparto se hace dentro
+    de cada zona y la clave de cada grupo es (grupo, zona), porque un camión no
+    puede tomar locales de dos zonas.
+    """
+    por_zona = {}
+    for nodo in nodos:
+        zona = nodo[2] if len(nodo) > 2 else None
+        por_zona.setdefault(zona, []).append((nodo[0], nodo[1]))
+    grupos = {}
+    for zona, lista in por_zona.items():
+        for g, idxs in _grupos_de_clientes(lista).items():
+            grupos[g if zona is None else (g, zona)] = idxs
+    return grupos
+
+
+def _grupos_de_clientes(nodos):
+    """Grupos por cliente de una lista de nodos [(índice, identificador)].
+
+    Walmart CD y Cencosud CD van solos y
+    el resto junto ("OTHER"), como en el modelo. La Vega es la excepción: el
+    modelo la deja ir en modo libre O en el de Cencosud (ver `allowed` en
+    construir_modelo), así que no abre un grupo propio si ya hay resto o
+    Cencosud; sólo lo abre, como resto, cuando no hay ninguno de los dos.
+
+    Antes La Vega contaba siempre como resto, y La Vega + Cencosud CD con un
+    solo camión se rechazaba con GRUPOS_EXCEDEN_CAMIONES aunque el modelo sí
+    la resolvía (las dos en el mismo viaje, en modo Cencosud).
+    """
+    grupos, la_vega = {}, []
+    for i, ident in nodos:
+        if _group(ident) == "OTHER" and _es_la_vega(ident):
+            la_vega.append(i)
+        else:
+            grupos.setdefault(_group(ident), []).append(i)
+    if la_vega:
+        destino = "CENCOSUD" if ("CENCOSUD" in grupos and "OTHER" not in grupos) else "OTHER"
+        grupos.setdefault(destino, []).extend(la_vega)
+    return grupos
+
+
 def modos_necesarios(locations, modo_free, modo_w, modo_c):
     """Qué modos hacen falta para ESTA solicitud.
 
@@ -275,8 +356,10 @@ def modos_necesarios(locations, modo_free, modo_w, modo_c):
       · Walmart  → hay locales del grupo WALMART
       · Cencosud → hay locales del grupo CENCOSUD
       · libre    → hay locales del resto
-    (los locales de La Vega admiten libre o Cencosud, así que no obligan a
-    ninguno de los dos por sí solos.)
+    (La Vega cuenta aquí como resto y abre el modo libre aunque también puede
+    ir en el de Cencosud: a lo más sobra un modo, que el solver no usa. Para
+    contar cuántos camiones hacen falta sí se la junta con Cencosud: ver
+    `_grupos_por_camion`.)
     """
     grupos = {_group(loc.get("identificador", "")) for loc in locations[1:]}
     modos = []
@@ -429,25 +512,38 @@ def revisar_factibilidad(ctx, diag):
                 ))
 
     # ── Grupos exclusivos: cada camión sólo puede tomar UN grupo por viaje ──
-    grupos = {}
-    for i in range(1, ctx["num_nodes"]):
-        grupos.setdefault(ctx["node_group"][i], []).append(i)
+    # Sin mezclar zonas, cada grupo además se parte por zona (Región
+    # Metropolitana / otras zonas): un camión no toma locales de las dos.
+    def _ident(i):
+        return ctx["extended_locations"][i].get("identificador", "")
+
+    zonas = ctx.get("node_zona_clase")  # None: se pueden mezclar zonas
+
+    def _nodo(i):
+        return (i, _ident(i)) if zonas is None else (i, _ident(i), zonas[i])
+
+    nota_zonas = ("No se mezclan zonas: un camión que va a la Región Metropolitana no reparte en otras "
+                  "zonas, así que cada zona necesita su propio camión.")
+    grupos = _grupos_por_camion([_nodo(i) for i in range(1, ctx["num_nodes"])])
     if len(grupos) > ctx["base_num_vehicles"]:
-        etiquetas = {"WALMART": "Walmart CD", "CENCOSUD": "Cencosud CD", "OTHER": "el resto de los locales"}
-        detalle = [f"{etiquetas.get(g, g)}: {len(v)} local(es)." for g, v in sorted(grupos.items())]
+        detalle = [f"{_etiqueta_grupo(g)}: {len(v)} local(es)." for g, v in sorted(grupos.items())]
+        sin_zonas = len(_grupos_por_camion([(i, _ident(i)) for i in range(1, ctx["num_nodes"])]))
+        por_zonas = zonas is not None and sin_zonas <= ctx["base_num_vehicles"]
         problemas.append(ErrorOptimizacion(
-            "GRUPOS_EXCEDEN_CAMIONES",
-            "Hay más grupos excluyentes de locales que camiones disponibles.",
-            detalle=[
-                "Walmart y Cencosud no pueden ir en el mismo viaje que otros clientes, "
-                "así que cada grupo necesita su propio camión.",
+            "ZONAS_EXCEDEN_CAMIONES" if por_zonas else "GRUPOS_EXCEDEN_CAMIONES",
+            ("Sin mezclar zonas, hacen falta más camiones de los seleccionados." if por_zonas
+             else "Hay más grupos excluyentes de locales que camiones disponibles."),
+            detalle=([nota_zonas] if zonas is not None else []) + [
+                "Walmart y Cencosud no pueden ir en el mismo viaje que otros clientes "
+                "(La Vega sí puede ir con Cencosud), así que cada grupo necesita su propio camión.",
                 f"Grupos en esta ruta: {len(grupos)}. Camiones seleccionados: {ctx['base_num_vehicles']}.",
             ] + detalle,
             sugerencias=[
                 f"Selecciona al menos {len(grupos)} camiones.",
+            ] + (["O permite mezclar zonas en los ajustes del algoritmo."] if zonas is not None else []) + [
                 "O deja los locales de un grupo para otra ruta.",
             ],
-            datos={"grupos": {g: len(v) for g, v in grupos.items()},
+            datos={"grupos": {_etiqueta_grupo(g): len(v) for g, v in grupos.items()},
                    "camiones": ctx["base_num_vehicles"]},
         ))
 
@@ -460,11 +556,11 @@ def revisar_factibilidad(ctx, diag):
     # refrigerados (el tercero de la flota era de carga seca).
     if nodos_refrigerados:
         camiones_refri = [i for i, f in enumerate(ctx["vehicle_free_base"]) if f]
-        grupos_frio = {}
-        for i in nodos_refrigerados:
-            grupos_frio.setdefault(ctx["node_group"][i], set()).add(_nombre_local(ctx["extended_locations"][i], i))
+        grupos_frio = {
+            g: {_nombre_local(ctx["extended_locations"][i], i) for i in nodos}
+            for g, nodos in _grupos_por_camion([_nodo(i) for i in nodos_refrigerados]).items()
+        }
         if camiones_refri and len(grupos_frio) > len(camiones_refri):
-            etiquetas = {"WALMART": "Walmart CD", "CENCOSUD": "Cencosud CD", "OTHER": "el resto de los clientes"}
             faltan = len(grupos_frio) - len(camiones_refri)
             problemas.append(ErrorOptimizacion(
                 "REFRIGERADOS_INSUFICIENTES_POR_GRUPO",
@@ -474,12 +570,16 @@ def revisar_factibilidad(ctx, diag):
                     "atiende un solo grupo por viaje: cada grupo que exige frío necesita su propio refrigerado.",
                     f"Refrigerados seleccionados: {len(camiones_refri)} de {len(ctx['vehicle_free_base'])} camiones. "
                     f"Grupos que exigen frío: {len(grupos_frio)}.",
-                ] + [f"{etiquetas.get(g, g)}: {', '.join(sorted(n))}." for g, n in sorted(grupos_frio.items())],
+                ] + ([nota_zonas] if zonas is not None else [])
+                  + [f"{_etiqueta_grupo(g, 'el resto de los clientes')}: {', '.join(sorted(n))}."
+                     for g, n in sorted(grupos_frio.items())],
                 sugerencias=[
                     f"Selecciona {faltan} camión(es) refrigerado(s) más.",
+                ] + (["O permite mezclar zonas en los ajustes del algoritmo."] if zonas is not None else []) + [
                     "O deja los locales de uno de esos grupos para otra ruta.",
                 ],
-                datos={"grupos_frio": {g: sorted(n) for g, n in grupos_frio.items()},
+                datos={"grupos_frio": {_etiqueta_grupo(g, 'el resto de los clientes'): sorted(n)
+                                       for g, n in grupos_frio.items()},
                        "refrigerados": len(camiones_refri)},
             ))
 
@@ -574,6 +674,11 @@ def revisar_ventanas(ctx, diag):
 # busca la mejor ruta, sólo saber si existe alguna.
 
 RELAJACIONES = [
+    # Solo se prueba si se pidió no mezclar zonas (ver diagnosticar_infactibilidad).
+    ("zonas", "ZONAS_SEPARADAS",
+     "La regla de no mezclar la Región Metropolitana con otras zonas impide armar la ruta.",
+     ["Permite mezclar zonas en los ajustes del algoritmo.",
+      "O selecciona otro camión para que cada zona tenga el suyo."]),
     ("ventanas", "VENTANAS_HORARIAS",
      "Los horarios de atención de los locales hacen imposible la ruta.",
      ["Revisa los horarios de apertura y cierre de los locales de esta ruta.",
@@ -660,6 +765,12 @@ def _motivo_probable_del_descarte(i, ctx):
     if max_palets is not None and palet_i > max_palets:
         return f"ocupa {_num(palet_i, 1)} palets y el camión con más espacio lleva {max_palets}"
 
+    if ctx.get("node_zona_clase") is not None:
+        zona = {ZONA_METRO: "de la Región Metropolitana", ZONA_OTRA: "de otras zonas"}.get(
+            ctx["node_zona_clase"][i], "de su zona")
+        return (f"no encaja junto con el resto de las paradas {zona} dentro de los tiempos disponibles "
+                f"(no se mezclan zonas: permitirlo en los ajustes del algoritmo puede destrabarlo)")
+
     return "no encaja junto con el resto de las paradas dentro de los tiempos disponibles"
 
 
@@ -730,10 +841,12 @@ def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intent
             )
 
     # ── Paso 2: soltar una restricción a la vez ───────────────────────────
-    for n_prueba, (clave, codigo, mensaje, sugerencias) in enumerate(RELAJACIONES, start=1):
+    # «zonas» solo si se pidió no mezclarlas: si no, soltarla no cambia nada.
+    relajaciones = [r for r in RELAJACIONES if r[0] != "zonas" or ctx.get("node_zona_clase") is not None]
+    for n_prueba, (clave, codigo, mensaje, sugerencias) in enumerate(relajaciones, start=1):
         update_job_status(diag.job_id, "diagnosticando",
-                          f"Buscando la causa: probando sin «{clave}» ({n_prueba} de {len(RELAJACIONES)})...",
-                          84 + int(12 * n_prueba / len(RELAJACIONES)))
+                          f"Buscando la causa: probando sin «{clave}» ({n_prueba} de {len(relajaciones)})...",
+                          84 + int(12 * n_prueba / len(relajaciones)))
         try:
             modelo = construir_modelo(relajar=frozenset([clave]), silencioso=True)
             sol = modelo["routing"].SolveWithParameters(_parametros_rapidos(segundos_por_intento))
@@ -901,6 +1014,14 @@ def optimize():
         esperas_recortadas = []
 
         # ─────────────────────────────────────────────────────────────────────
+        # MEZCLAR ZONAS (pedido del usuario, 13-10-2026)
+        # ─────────────────────────────────────────────────────────────────────
+        # Lo decide quien arma la ruta, junto al tope de espera. Sin el dato se
+        # mezclan, como siempre. En falso, un camión que lleva algo a la Región
+        # Metropolitana solo reparte en la Región Metropolitana (ver _zona_clase).
+        mezclar_zonas = _leer_bool(data.get("mezclar_zonas"), por_defecto=True)
+
+        # ─────────────────────────────────────────────────────────────────────
         # HOLGURA DE LA HORA DE SALIDA (minutos)
         # ─────────────────────────────────────────────────────────────────────
         # La hora de salida que se elige por camión es un compromiso operativo
@@ -982,19 +1103,35 @@ def optimize():
         # el modelo pasa de 3 vehículos virtuales por camión a 1.
         MODES, _grupos_presentes = modos_necesarios(locations, MODE_FREE, MODE_W, MODE_C)
         _nombres_modo = {MODE_FREE: "libre", MODE_W: "Walmart", MODE_C: "Cencosud"}
+
+        # Cada vehículo virtual es un camión en un modo y, sin mezclar zonas,
+        # además en una zona: el modelo ya obliga a que cada camión use uno
+        # solo, así que con la zona en el vehículo un camión queda en UNA zona
+        # sin otra restricción. Mezclando zonas la flota es la de siempre.
+        if mezclar_zonas:
+            COMBOS = [(m, None) for m in MODES]
+        else:
+            COMBOS = []
+            for _clase in (ZONA_METRO, ZONA_OTRA):
+                _de_la_zona = [loc for loc in locations[1:] if _zona_clase(loc.get("zona")) == _clase]
+                if _de_la_zona:
+                    _modos_zona, _ = modos_necesarios([locations[0]] + _de_la_zona, MODE_FREE, MODE_W, MODE_C)
+                    COMBOS.extend((m, _clase) for m in _modos_zona)
+            COMBOS = COMBOS or [(MODE_FREE, ZONA_OTRA)]
+
         diag.info("FLOTA_VIRTUAL",
                   f"Grupos en la ruta: {', '.join(sorted(_grupos_presentes))}. "
-                  f"Modos activos: {', '.join(_nombres_modo[m] for m in MODES)} "
-                  f"→ {base_num_vehicles * len(MODES)} vehículos en el modelo "
+                  f"Modos activos: {', '.join(_nombres_modo[m] + (f' ({ZONA_ETIQUETAS[z]})' if z else '') for m, z in COMBOS)} "
+                  f"→ {base_num_vehicles * len(COMBOS)} vehículos en el modelo "
                   f"(antes siempre {base_num_vehicles * 3}).")
 
         vehicle_capacities, vehicle_consume, vehicle_free, vehicle_palets = [], [], [], []
-        vehicle_mapping, vehicle_trip_no, vehicle_mode = {}, {}, {}
+        vehicle_mapping, vehicle_trip_no, vehicle_mode, vehicle_zona = {}, {}, {}, {}
         max_trips_per_vehicle = 1 
 
         for idx in range(base_num_vehicles):
             for trip in range(max_trips_per_vehicle):
-                for mode in MODES:
+                for mode, zona_v in COMBOS:
                     vehicle_capacities.append(vehicle_capacities_base[idx])
                     vehicle_consume.append(vehicle_consume_base[idx])
                     vehicle_free.append(vehicle_free_base[idx])
@@ -1003,6 +1140,7 @@ def optimize():
                     vehicle_mapping[v_idx] = idx
                     vehicle_trip_no[v_idx] = trip
                     vehicle_mode[v_idx] = mode
+                    vehicle_zona[v_idx] = zona_v
 
         num_vehicles = len(vehicle_capacities)
         max_vehicle_capacity = max(vehicle_capacities)
@@ -1162,6 +1300,7 @@ def optimize():
 
         num_nodes = len(extended_locations)
         node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
+        node_zona_clase = [_zona_clase(loc.get("zona")) for loc in extended_locations]
 
         # -------------------------------------------------------------------------
         # FUNCIÓN DE PARES DE BODEGA COMPARTIDA (POR ID)
@@ -1241,6 +1380,8 @@ def optimize():
             "extended_time_matrix": extended_time_matrix,
             "split_mapping": split_mapping,
             "node_group": node_group,
+            # None si se pueden mezclar zonas: las revisiones lo usan para saberlo.
+            "node_zona_clase": (None if mezclar_zonas else node_zona_clase),
             "num_nodes": num_nodes,
             "base_num_vehicles": base_num_vehicles,
             "vehicle_capacities_base": vehicle_capacities_base,
@@ -1264,6 +1405,11 @@ def optimize():
                            f"{nombre}: espera estimada {int(original)} min, recortada al tope de {int(tope)} min.")
         if not limitar_espera:
             diag.info("ESPERA_SIN_TOPE", "Sin tope de espera: se usa la espera real estimada de cada local.")
+        if not mezclar_zonas:
+            _n_metro = sum(1 for z in node_zona_clase[1:] if z == ZONA_METRO)
+            diag.info("ZONAS_SEPARADAS",
+                      f"No se mezclan zonas: {_n_metro} parada(s) de la Región Metropolitana y "
+                      f"{num_nodes - 1 - _n_metro} de otras zonas van en camiones distintos.")
 
         problemas = revisar_factibilidad(ctx, diag)
         ventanas_duras, ventanas_avisos = revisar_ventanas(ctx, diag)
@@ -1361,6 +1507,15 @@ def optimize():
                             allowed = {MODE_FREE}
                     for v in range(num_vehicles):
                         if vehicle_mode[v] not in allowed:
+                            routing.VehicleVar(node_idx).RemoveValue(v)
+
+            # ── No mezclar zonas: cada local solo en los vehículos de su zona ──
+            # (un vehículo con zona None es de la flota de siempre: acepta todo)
+            if not mezclar_zonas and "zonas" not in relajar:
+                for node_index in range(1, num_nodes):
+                    node_idx = manager.NodeToIndex(node_index)
+                    for v in range(num_vehicles):
+                        if vehicle_zona[v] is not None and vehicle_zona[v] != node_zona_clase[node_index]:
                             routing.VehicleVar(node_idx).RemoveValue(v)
 
             solver = routing.solver()
@@ -2084,6 +2239,7 @@ def optimize():
                         "identificador": ext.get("identificador"),
                         "node_index": node,
                         "group": node_group[node],
+                        "zona": ext.get("zona"),
                         "requires_refrigeration": bool(extended_refrigerate[node]),
                         "products": demanda,
                         "products_detail": products_detail,
@@ -2224,6 +2380,8 @@ def optimize():
             agg["trips"].append({
                 "trip_no": trip_no,
                 "mode": mode,  
+                # METRO / OTRA si no se mezclan zonas; None si se pueden mezclar.
+                "zona_clase": vehicle_zona.get(v),
                 "route": cleaned_route,
                 "deliveries": deliveries,
                 "num_stops": int(stops_count),
@@ -2400,6 +2558,7 @@ def optimize():
                 "max_departure_slack_minutes": max_departure_slack,
                 "limitar_espera": bool(limitar_espera),
                 "max_wait_minutes": (max_wait_minutes_cfg if limitar_espera else None),
+                "mezclar_zonas": bool(mezclar_zonas),
                 "esperas_recortadas": len(esperas_recortadas),
                 "vehicle_departure_times": vehicle_departure_times_raw,
                 "departure_times_by_truck": departure_times_by_truck_raw,

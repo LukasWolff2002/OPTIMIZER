@@ -606,12 +606,113 @@ def revisar_factibilidad(ctx, diag):
     return problemas
 
 
+def _descarga_mas_larga_que_ventana(apertura, cierre, cl_gap, servicio):
+    """La descarga no cabe entre la apertura y el cierre (menos la tolerancia de cierre).
+
+    Desde el 15-10-2026 esos locales se aceptan si el camión llega antes de que
+    abra: la descarga empieza al abrir y termina después del cierre. Antes
+    dejaban la ruta entera sin solución.
+    """
+    if apertura is None or cierre is None or cierre <= apertura:
+        return False
+    largo = cierre - max(0, int(cl_gap or 0)) - apertura
+    return int(round(servicio)) > largo
+
+
+# ---------------------------------------------------------------------
+# Hora de salida de cada camión
+# ---------------------------------------------------------------------
+#
+# El modelo minimiza la jornada de la FLOTA (de la primera salida al último
+# regreso): la hora en que arranca cada camión le da lo mismo, salvo la del que
+# sale primero. Así todos quedaban con el mismo atraso (cuatro camiones pedidos
+# a las 22:00 salían los cuatro a las 23:00: el del CD llegaba sin margen y los
+# otros tres esperaban cinco horas a que abriera su primer local), y el ajuste
+# de después atrasaba la salida aunque no hubiera espera que ahorrar. Desde el
+# 15-10-2026 la salida de cada camión se calcula sobre SU recorrido.
+
+SEGURIDAD_LLEGADA_MINUTOS = 30
+
+
+def _recorrer_viaje(paradas, salida, vuelta):
+    """Horario de un viaje que sale a `salida`: si llega antes de que pueda
+    estar en el andén, espera; descarga desde que abre. Devuelve (llegadas,
+    inicios de descarga, salidas, regreso, minutos de espera en cada parada)."""
+    t = salida
+    llegadas, inicios, salidas, esperas = [], [], [], []
+    for p in paradas:
+        en_el_lugar = t + p["viaje"]
+        llegada = en_el_lugar if p["desde"] is None else max(en_el_lugar, p["desde"])
+        inicio = llegada if p["abre"] is None else max(llegada, p["abre"])
+        t = inicio + p["descarga"]
+        llegadas.append(llegada)
+        inicios.append(inicio)
+        salidas.append(t)
+        esperas.append(inicio - en_el_lugar)
+    return llegadas, inicios, salidas, t + vuelta, esperas
+
+
+def horario_del_viaje(paradas, salida_pedida, margen, vuelta, seguridad=SEGURIDAD_LLEGADA_MINUTOS):
+    """La salida de UN camión y su horario, sin mirar a los demás.
+
+    Sale a la hora pedida y se atrasa sólo lo que le ahorra espera (a que abra
+    un local), sin pasar del margen y sin acercar ninguna llegada a su tope a
+    menos de `seguridad` minutos (la que ya estaba más cerca no se mueve).
+
+    paradas: [{"viaje", "desde", "abre", "tope", "descarga"}] en orden, en
+    minutos desde la salida de referencia; desde, abre y tope pueden ser None.
+    Devuelve None si a la hora pedida ya no se cumple algún tope (el solver lo
+    asegura, así que no debería pasar): entonces vale el horario del solver.
+    """
+    llegadas0, _, _, _, esperas0 = _recorrer_viaje(paradas, salida_pedida, vuelta)
+    espera0 = sum(esperas0)
+    if any(p["tope"] is not None and llegada > p["tope"] for p, llegada in zip(paradas, llegadas0)):
+        return None
+
+    def cabe(atraso):
+        llegadas = _recorrer_viaje(paradas, salida_pedida + atraso, vuelta)[0]
+        return all(p["tope"] is None or ahora - antes <= max(0, p["tope"] - antes - seguridad)
+                   for p, antes, ahora in zip(paradas, llegadas0, llegadas))
+
+    # Atrasar sirve hasta comerse la espera: más allá corre todo el viaje. Lo
+    # que cabe disminuye con el atraso, así que se busca el mayor por mitades.
+    bajo, alto = 0, max(0, int(espera0))
+    while bajo < alto:
+        medio = (bajo + alto + 1) // 2
+        if cabe(medio):
+            bajo = medio
+        else:
+            alto = medio - 1
+    sin_espera = bajo
+    atraso = min(sin_espera, max(0, int(margen)))
+
+    llegadas, inicios, salidas, regreso, esperas = _recorrer_viaje(paradas, salida_pedida + atraso, vuelta)
+    return {
+        "salida": salida_pedida + atraso,
+        "atraso": atraso,
+        "llegadas": llegadas,
+        "inicios": inicios,
+        "salidas": salidas,
+        "regreso": regreso,
+        "esperas": esperas,
+        "espera": sum(esperas),
+        "esperas_sin_atraso": esperas0,
+        "espera_sin_atraso": espera0,
+        # Lo que se atrasaría con margen de sobra, y la espera que quedaría.
+        "atraso_sin_tope": sin_espera,
+        "espera_sin_tope": espera0 - sin_espera,
+    }
+
+
 def revisar_ventanas(ctx, diag):
     """Locales cuya ventana horaria es imposible de cumplir.
 
     Devuelve (problemas_duros, avisos). Un problema duro es un local al que no
     se puede llegar a tiempo ni saliendo directo del packing: mientras todos los
     locales sean obligatorios, uno solo así deja la ruta entera sin solución.
+
+    Para un local cuya descarga dura más que su horario, «a tiempo» es antes de
+    que abra (ver _descarga_mas_larga_que_ventana).
     """
     duros, avisos = [], []
     ref = ctx["reference_departure_minutes"]
@@ -620,6 +721,7 @@ def revisar_ventanas(ctx, diag):
 
     tiempos_desde_deposito = ctx["extended_time_matrix"][0] if ctx["extended_time_matrix"] else None
     salida_min = min([o for o in ctx["vehicle_start_offsets_base"] if o is not None], default=0)
+    antes_de_abrir = ctx.get("antes_de_abrir") or [False] * ctx["num_nodes"]
 
     for i in range(1, ctx["num_nodes"]):
         loc = ctx["extended_locations"][i]
@@ -635,31 +737,37 @@ def revisar_ventanas(ctx, diag):
                           f"antes de abrir ({_fmt_hhmm(ref + apertura)})."))
             continue
 
-        if apertura is not None and cierre is not None:
-            largo = cierre - cl_gap - apertura
-            if servicio > largo:
-                duros.append((i, nombre, "SERVICIO_MAYOR_QUE_VENTANA",
-                              f"{nombre}: la descarga toma {servicio} min y el local sólo atiende "
-                              f"{largo} min ({_fmt_hhmm(ref + apertura)} a "
-                              f"{_fmt_hhmm(ref + cierre - cl_gap)})."))
-                continue
-
+        horario = (f"{_fmt_hhmm(ref + apertura)} a {_fmt_hhmm(ref + cierre - cl_gap)}"
+                   if apertura is not None and cierre is not None else "")
         if cierre is not None and tiempos_desde_deposito is not None:
-            viaje = int(round(tiempos_desde_deposito[ctx["split_mapping"].get(i, i)]))
+            # La matriz ya está extendida: se indexa con el nodo, no con el local original.
+            viaje = int(round(tiempos_desde_deposito[i]))
             llegada_mas_temprana = salida_min + viaje
-            tope_llegada = cierre - cl_gap - servicio
+            if antes_de_abrir[i]:
+                tope_llegada = apertura
+                exigencia = (f"y como la descarga ({servicio} min) dura más que su horario ({horario}), "
+                             f"hay que llegar antes de que abra, a las {_fmt_hhmm(ref + apertura)}.")
+            else:
+                tope_llegada = cierre - cl_gap - servicio
+                exigencia = (f"y hay que estar antes de las {_fmt_hhmm(ref + tope_llegada)} "
+                             f"(cierre {_fmt_hhmm(ref + cierre)} − {cl_gap} min de tolerancia "
+                             f"− {servicio} min de descarga).")
             if llegada_mas_temprana > tope_llegada:
                 duros.append((i, nombre, "VENTANA_INALCANZABLE",
                               f"{nombre}: saliendo del packing a las {_fmt_hhmm(ref + salida_min)} "
                               f"se llega a las {_fmt_hhmm(ref + llegada_mas_temprana)} como muy pronto, "
-                              f"y hay que estar antes de las {_fmt_hhmm(ref + tope_llegada)} "
-                              f"(cierre {_fmt_hhmm(ref + cierre)} − {cl_gap} min de tolerancia "
-                              f"− {servicio} min de descarga)."))
+                              f"{exigencia}"))
                 continue
 
+            if antes_de_abrir[i]:
+                diag.aviso("LLEGAR_ANTES_DE_ABRIR",
+                           f"{nombre}: la descarga ({servicio} min) dura más que su horario ({horario}): "
+                           f"el camión tiene que llegar antes de que abra y la descarga termina "
+                           f"después del cierre.")
             margen = tope_llegada - llegada_mas_temprana
             if margen < 30:
-                avisos.append(f"{nombre}: quedan sólo {margen} min de margen para llegar a tiempo.")
+                avisos.append(f"{nombre}: quedan sólo {margen} min de margen para llegar "
+                              f"{'antes de que abra' if antes_de_abrir[i] else 'a tiempo'}.")
 
     return duros, avisos
 
@@ -738,24 +846,26 @@ def _motivo_probable_del_descarte(i, ctx):
     if ctx["extended_refrigerate"][i] and not any(ctx["vehicle_free_base"]):
         return "exige camión refrigerado y no hay ninguno seleccionado"
 
+    antes = (ctx.get("antes_de_abrir") or [False] * ctx["num_nodes"])[i]
+
+    # La matriz ya está extendida: se indexa con el nodo, no con el local original.
     if ref is not None and cierre is not None:
         tiempos = ctx["extended_time_matrix"][0] if ctx["extended_time_matrix"] else None
         if tiempos is not None:
-            viaje = int(round(tiempos[ctx["split_mapping"].get(i, i)]))
+            viaje = int(round(tiempos[i]))
             salida_min = min([o for o in ctx["vehicle_start_offsets_base"] if o is not None], default=0)
-            tope = cierre - cl_gap - servicio
+            tope = apertura if antes else cierre - cl_gap - servicio
             if salida_min + viaje > tope:
+                if antes:
+                    return (f"la descarga ({servicio} min) dura más que su horario, así que hay que llegar "
+                            f"antes de que abra ({_fmt_hhmm(ref + apertura)}), y el viaje desde el packing "
+                            f"toma {viaje} min: no se alcanza")
                 return (f"cierra a las {_fmt_hhmm(ref + cierre)} y el viaje desde el packing "
                         f"toma {viaje} min: no se alcanza a llegar")
 
-    if apertura is not None and cierre is not None and servicio > (cierre - cl_gap - apertura):
-        return (f"la descarga toma {servicio} min y el local atiende sólo "
-                f"{cierre - cl_gap - apertura} min")
-
     tiempos = ctx["extended_time_matrix"][0] if ctx["extended_time_matrix"] else None
     if tiempos is not None:
-        j = ctx["split_mapping"].get(i, i)
-        ida_vuelta = int(round(tiempos[j])) + int(round(ctx["extended_time_matrix"][j][0]))
+        ida_vuelta = int(round(tiempos[i])) + int(round(ctx["extended_time_matrix"][i][0]))
         if ida_vuelta > ctx["HORIZON"]:
             return (f"ir y volver toma {ida_vuelta} min de conducción y el tope por camión "
                     f"es de {ctx['HORIZON']} min")
@@ -764,6 +874,10 @@ def _motivo_probable_del_descarte(i, ctx):
     max_palets = max([p for p in ctx["vehicle_palets_base"] if p < ctx["PALLET_INF"]], default=None)
     if max_palets is not None and palet_i > max_palets:
         return f"ocupa {_num(palet_i, 1)} palets y el camión con más espacio lleva {max_palets}"
+
+    if antes and ref is not None:
+        return (f"la descarga ({servicio} min) dura más que su horario y el camión tiene que llegar "
+                f"antes de que abra ({_fmt_hhmm(ref + apertura)}): no calza con el resto de las paradas")
 
     if ctx.get("node_zona_clase") is not None:
         zona = {ZONA_METRO: "de la Región Metropolitana", ZONA_OTRA: "de otras zonas"}.get(
@@ -1301,6 +1415,13 @@ def optimize():
         num_nodes = len(extended_locations)
         node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
         node_zona_clase = [_zona_clase(loc.get("zona")) for loc in extended_locations]
+        # Locales cuya descarga dura más que su horario: se atienden si el camión
+        # llega antes de que abran (el tope de llegada pasa a ser la apertura).
+        antes_de_abrir = [False] + [
+            _descarga_mas_larga_que_ventana(extended_opening[i], extended_deadline[i],
+                                            extended_closing_gap[i], extended_wait[i])
+            for i in range(1, num_nodes)
+        ]
 
         # -------------------------------------------------------------------------
         # FUNCIÓN DE PARES DE BODEGA COMPARTIDA (POR ID)
@@ -1382,6 +1503,7 @@ def optimize():
             "node_group": node_group,
             # None si se pueden mezclar zonas: las revisiones lo usan para saberlo.
             "node_zona_clase": (None if mezclar_zonas else node_zona_clase),
+            "antes_de_abrir": antes_de_abrir,
             "num_nodes": num_nodes,
             "base_num_vehicles": base_num_vehicles,
             "vehicle_capacities_base": vehicle_capacities_base,
@@ -1824,7 +1946,17 @@ def optimize():
                         _p(f"   Ventana 2 (fija):   {sv_open_clock} → {sv_close_clock}")
 
                     else:
-                        if extended_deadline[node] is not None:
+                        if antes_de_abrir[node]:
+                            # La descarga dura más que el horario: el camión tiene que
+                            # llegar antes de que abra (la restricción 1 de abajo dice
+                            # desde cuándo). La descarga empieza al abrir y termina
+                            # después del cierre, por eso no rige «cierre − descarga».
+                            apertura_rel = int(extended_opening[node])
+                            time_dimension.CumulVar(idx).SetRange(0, max(0, apertura_rel))
+                            _p(f"🚪 {loc_name} (ID {loc_id}): la descarga ({wait_here} min) dura más que "
+                               f"su horario → llegada ≤ apertura "
+                               f"{_fmt_hhmm((reference_departure_minutes + apertura_rel) % (24 * 60))}")
+                        elif extended_deadline[node] is not None:
                             cl_gap = int(extended_closing_gap[node]) if extended_closing_gap[node] is not None else 0
                             if cl_gap < 0:
                                 cl_gap = 0
@@ -2084,6 +2216,36 @@ def optimize():
         def cumul(dim, idx):
             return solution.Value(dim.CumulVar(idx))
 
+        def _paradas_del_viaje(nodos):
+            """Las paradas de un recorrido para horario_del_viaje, con las
+            reglas de tiempo del modelo (ventana, tolerancias, descarga)."""
+            paradas, previo = [], depot
+            for node in nodos:
+                abre = extended_opening[node]
+                op_gap = max(0, int(extended_opening_gap[node] or 0))
+                servicio = int(round(extended_wait[node]))
+                if antes_de_abrir[node]:
+                    tope = max(0, int(abre))
+                elif extended_deadline[node] is not None:
+                    _cl_gap = max(0, int(extended_closing_gap[node] or 0))
+                    tope = int(extended_deadline[node]) - _cl_gap - servicio
+                    tope = tope if tope > 0 else None   # el modelo no pone tope en ese caso
+                else:
+                    tope = None
+                paradas.append({
+                    "viaje": int(round(extended_time_matrix[previo][node])),
+                    "desde": (int(abre) - op_gap) if abre is not None and int(abre) - op_gap > 0 else None,
+                    "abre": int(abre) if abre is not None else None,
+                    "tope": tope,
+                    "descarga": 0 if is_shared_warehouse_pair(previo, node) else servicio,
+                })
+                previo = node
+            return paradas, int(round(extended_time_matrix[previo][depot]))
+
+        def _es_nicolas_palma(node):
+            ident = (extended_locations[node].get("identificador", "") or "").upper()
+            return "NICOLAS PALMA" in ident or "NICOLÁS PALMA" in ident
+
         for v in range(num_vehicles):
             start = routing.Start(v)
             if routing.IsEnd(solution.Value(routing.NextVar(start))):
@@ -2095,9 +2257,28 @@ def optimize():
             actual_start = solution.Value(time_dimension.CumulVar(routing.Start(v)))
             start_offset = actual_start  # en vez del offset calculado del input
 
+            # Horario propio del camión (ver horario_del_viaje): sale a SU hora
+            # pedida y se atrasa sólo si eso le ahorra espera. Queda el del
+            # solver sin hora de referencia, en viajes de recarga y con la doble
+            # ventana de Nicolás Palma, que este cálculo no conoce.
+            horario = None
+            _nodos_viaje = []
+            _idx = solution.Value(routing.NextVar(start))
+            while not routing.IsEnd(_idx):
+                _nodos_viaje.append(manager.IndexToNode(_idx))
+                _idx = solution.Value(routing.NextVar(_idx))
+            if (reference_departure_minutes is not None and trip_no == 0
+                    and not (es_dia_segunda_ventana_np and any(_es_nicolas_palma(n) for n in _nodos_viaje))):
+                _paradas, _vuelta = _paradas_del_viaje(_nodos_viaje)
+                horario = horario_del_viaje(_paradas, vehicle_start_offsets_base[main_vehicle],
+                                            max_departure_slack, _vuelta)
+            if horario is not None:
+                start_offset = horario["salida"]
+                llegada_al_nodo = dict(zip(_nodos_viaje, horario["llegadas"]))
+
             # La hora de salida real del camión:
             if reference_departure_minutes is not None:
-                actual_departure_abs = reference_departure_minutes + actual_start
+                actual_departure_abs = reference_departure_minutes + start_offset
                 departure_clock_v = _fmt_hhmm(actual_departure_abs)
 
             route_nodes = []
@@ -2144,7 +2325,8 @@ def optimize():
                         })
 
                     idx = index
-                    time_cumul = cumul(time_dimension, idx)     
+                    time_cumul = (llegada_al_nodo[node] if horario is not None
+                                  else cumul(time_dimension, idx))
                     drive_cumul = cumul(drive_dimension, idx)   
                     stops_cumul = cumul(stops_dimension, idx)
                     
@@ -2184,11 +2366,16 @@ def optimize():
                     latest_arrival_from_departure = None
                     deadline_from_departure = None
 
+                    llega_antes_de_abrir = bool(antes_de_abrir[node])
                     if deadline_rel is not None:
-                        # deadline de llegada = close - closing_gap - service_time
-                        _raw_eff_ext = int(deadline_rel) - cl_gap - wait_here
-                        eff_deadline = _raw_eff_ext if _raw_eff_ext >= 0 else int(deadline_rel) - cl_gap
-                        deadline_ub_eff = max(0, eff_deadline) 
+                        if llega_antes_de_abrir:
+                            # La descarga dura más que el horario: el tope de llegada es la apertura.
+                            eff_deadline = int(extended_opening[node])
+                        else:
+                            # deadline de llegada = close - closing_gap - service_time
+                            _raw_eff_ext = int(deadline_rel) - cl_gap - wait_here
+                            eff_deadline = _raw_eff_ext if _raw_eff_ext >= 0 else int(deadline_rel) - cl_gap
+                        deadline_ub_eff = max(0, eff_deadline)
                         deadline_from_departure = eff_deadline - start_offset
                         latest_arrival_from_departure = deadline_ub_eff - start_offset
 
@@ -2220,7 +2407,10 @@ def optimize():
                         if extended_deadline[node] is not None:
                             close_abs        = reference_departure_minutes + extended_deadline[node]
                             close_clock      = _fmt_hhmm(close_abs)
-                            close_eff_clock  = _fmt_hhmm(close_abs - cl_gap - wait_here)  # arrival deadline = close - gap - service
+                            # tope de llegada: cierre − tolerancia − descarga, o la apertura
+                            # cuando la descarga dura más que el horario
+                            close_eff_clock  = (open_clock if llega_antes_de_abrir
+                                                else _fmt_hhmm(close_abs - cl_gap - wait_here))
 
                     opening_from_departure = None
                     closing_from_departure = None
@@ -2259,6 +2449,9 @@ def optimize():
                             "close_eff_clock":  close_eff_clock,  
                             "opening_gap_minutes": int(op_gap),
                             "closing_gap_minutes": int(cl_gap),
+                            # La descarga dura más que el horario: llega antes de que abra
+                            # y termina después del cierre.
+                            "llega_antes_de_abrir": llega_antes_de_abrir,
                             "arrival_minutes_from_departure":   int(arrival_from_departure),
                             "departure_minutes_from_departure": int(departure_from_departure),
                             "opening_minutes_from_departure": (
@@ -2295,7 +2488,8 @@ def optimize():
                 dist_v += d
                 total_distance += d
 
-            time_total  = solution.Value(time_dimension.CumulVar(routing.End(v)))  
+            time_total  = (horario["regreso"] if horario is not None
+                           else solution.Value(time_dimension.CumulVar(routing.End(v))))
             time_drive  = solution.Value(drive_dimension.CumulVar(routing.End(v))) 
             stops_count = solution.Value(stops_dimension.CumulVar(routing.End(v)))
 
@@ -2341,24 +2535,58 @@ def optimize():
             )
             trip_duration_minutes = return_minutes_from_departure
 
-            # Hora de salida pedida por el usuario para ESTE camión, y cuánto la
-            # movió el solver. El ajuste fino de más abajo puede moverla más,
-            # pero el total nunca supera `max_departure_slack`.
+            # Hora de salida pedida para ESTE camión y cuánto se atrasó (nunca
+            # más que `max_departure_slack`; ver horario_del_viaje).
             _salida_pedida_rel = vehicle_start_offsets_base[main_vehicle] if reference_departure_minutes is not None else 0
             _salida_pedida_clock = (_fmt_hhmm(reference_departure_minutes + _salida_pedida_rel)
                                     if reference_departure_minutes is not None else None)
-            _retraso_solver = max(0, int(start_offset) - int(_salida_pedida_rel))
+            _retraso = max(0, int(start_offset) - int(_salida_pedida_rel))
+            _motivo_retraso = (f"el cálculo atrasó la salida {_retraso} min para calzar con los "
+                               f"horarios de atención de los locales" if _retraso > 0 else None)
+            # Si el margen no alcanzó para no esperar, cuánto haría falta: la
+            # app lo avisa en la pre-ruta con la patente del camión.
+            _espera_por_margen = None
+            if horario is not None:
+                def _donde(esperas):
+                    """El local donde más espera el camión."""
+                    k = esperas.index(max(esperas))
+                    return _nombre_local(extended_locations[_nodos_viaje[k]], _nodos_viaje[k])
+
+                if _retraso > 0:
+                    _local = _donde(horario["esperas_sin_atraso"])
+                    if horario["espera"] == 0:
+                        _motivo_retraso = f"se atrasó la salida {_retraso} min para no esperar a que abra {_local}"
+                    elif _retraso >= max_departure_slack:
+                        _motivo_retraso = (f"se atrasó la salida {_retraso} min, todo el margen permitido, "
+                                           f"para esperar menos a que abra {_local}")
+                    else:
+                        _motivo_retraso = (f"se atrasó la salida {_retraso} min para esperar menos a que abra "
+                                           f"{_local}: más atraso dejaría otra parada con menos de "
+                                           f"{SEGURIDAD_LLEGADA_MINUTOS} min de margen")
+                if (horario["atraso"] < horario["atraso_sin_tope"]
+                        and horario["espera"] >= SEGURIDAD_LLEGADA_MINUTOS):
+                    _k = horario["esperas"].index(max(horario["esperas"]))
+                    _espera_por_margen = {
+                        # Toda la espera del viaje, también la de antes de poder
+                        # entrar al andén, y dónde y desde qué hora descarga.
+                        "minutos": int(horario["espera"]),
+                        "local": _donde(horario["esperas"]),
+                        "descarga_desde": _fmt_hhmm(reference_departure_minutes + horario["inicios"][_k]),
+                        "salida": _fmt_hhmm(reference_departure_minutes + horario["salida"]),
+                        "margen": int(max_departure_slack),
+                        "margen_necesario": int(horario["atraso_sin_tope"]),
+                        "salida_sin_espera": _fmt_hhmm(reference_departure_minutes + _salida_pedida_rel
+                                                       + horario["atraso_sin_tope"]),
+                        "espera_con_margen_necesario": int(horario["espera_sin_tope"]),
+                    }
 
             agg = vehicle_trips.setdefault(main_vehicle, {
                 "vehicle": main_vehicle,
                 "departure_clock": departure_clock_v,
                 "departure_clock_solicitado": _salida_pedida_clock,
-                "departure_delay_minutes": _retraso_solver,
-                "departure_delay_motivo": (
-                    f"el cálculo atrasó la salida {_retraso_solver} min para calzar con los "
-                    f"horarios de atención de los locales"
-                    if _retraso_solver > 0 else None
-                ),
+                "departure_delay_minutes": _retraso,
+                "departure_delay_motivo": _motivo_retraso,
+                "espera_por_margen": _espera_por_margen,
                 "max_departure_slack_minutes": max_departure_slack,
                 "trips": [],
                 "total_distance": 0.0,
@@ -2413,10 +2641,12 @@ def optimize():
             total_palets_sum += float(trip_palets_sum)
 
         # ─────────────────────────────────────────────────────────────────────
-        # POST-PROCESAMIENTO: MODOS + FINE-TUNING DE HORA DE SALIDA
+        # POST-PROCESAMIENTO: MODOS
         # ─────────────────────────────────────────────────────────────────────
-        SAFETY_MARGIN_MINUTES = 30
-
+        # La hora de salida ya no se ajusta aquí: la calcula horario_del_viaje
+        # para cada camión en la extracción. El ajuste de antes atrasaba hasta
+        # dejar 30 min de holgura en la parada más justa aunque no hubiera
+        # espera que ahorrar, y con el mismo margen para todos.
         for vdata in vehicle_trips.values():
             modes_set = vdata.get("modes_used", set())
             mode_labels = {0: "OTHER", 1: "WALMART", 2: "CENCOSUD"}
@@ -2425,92 +2655,7 @@ def optimize():
                 "labels": [mode_labels[m] for m in sorted(modes_set) if m in mode_labels]
             }
 
-            for trip in vdata.get("trips", []):
-                deliveries = trip.get("deliveries", [])
-                if not deliveries:
-                    continue
-
-                # Usar deadline_slack mínimo como límite real de retraso posible
-                deadline_slacks = [
-                    int(d["timing"]["deadline_slack_minutes"])
-                    for d in deliveries
-                    if d.get("timing", {}).get("deadline_slack_minutes") is not None
-                ]
-                if not deadline_slacks:
-                    continue
-
-                max_valid_delay = min(deadline_slacks)
-                optimal_delay   = max(0, max_valid_delay - SAFETY_MARGIN_MINUTES)
-
-                # El retraso TOTAL respecto de la hora pedida (lo que ya movió el
-                # solver + lo que mueve este ajuste) no puede pasar del margen
-                # que autorizó el usuario.
-                _ya_movido = int(vdata.get("departure_delay_minutes") or 0)
-                _margen_restante = max(0, int(vdata.get("max_departure_slack_minutes") or 0) - _ya_movido)
-                optimal_delay = min(optimal_delay, _margen_restante)
-
-                if optimal_delay <= 0:
-                    continue
-
-                # Cuánta espera ociosa se ahorra al salir más tarde: es la razón
-                # por la que se mueve la salida, y hay que poder explicarla.
-                _espera_ociosa = sum(int(d.get("timing", {}).get("waiting_at_node_minutes") or 0)
-                                     for d in deliveries)
-
-                # Sobreescribir hora de salida
-                new_dep_clock          = _add_minutes_to_clock(vdata.get("departure_clock"), optimal_delay)
-                vdata["departure_clock"] = new_dep_clock
-                trip["departure_clock"]  = new_dep_clock
-                vdata["departure_delay_minutes"] = _ya_movido + optimal_delay
-                vdata["departure_delay_motivo"] = (
-                    f"se atrasó la salida {_ya_movido + optimal_delay} min para no esperar "
-                    f"{min(_espera_ociosa, optimal_delay)} min detenido en el primer local"
-                    if _espera_ociosa > 0 else
-                    f"se atrasó la salida {_ya_movido + optimal_delay} min para llegar más ajustado a los horarios"
-                )
-
-                current_delay = optimal_delay
-
-                for d in deliveries:
-                    timing = d["timing"]
-
-                    timing["eta_clock"] = _add_minutes_to_clock(timing.get("eta_clock"), current_delay)
-                    # max(0, …): el ajuste de la hora de salida puede restar más
-                    # minutos de los que había y dejar la llegada en negativo,
-                    # que después se muestra como una parada "antes de salir".
-                    timing["arrival_minutes_from_departure"] = max(0, (
-                        int(timing.get("arrival_minutes_from_departure") or 0)
-                        - (optimal_delay - current_delay)
-                    ))
-                    # Sincronizar cumul.time_from_departure con el valor fine-tuneado.
-                    # Sin esto, cumul queda con el valor raw (pre-fine-tuning) y difiere
-                    # de arrival_minutes_from_departure en las paradas post idle-wait.
-                    if d.get("cumul") is not None:
-                        d["cumul"]["time_from_departure"] = timing["arrival_minutes_from_departure"]
-
-                    idle_wait    = int(timing.get("waiting_at_node_minutes") or 0)
-                    service_time = int(timing.get("wait_minutes") or 0)  # fijo, no cambia
-
-                    new_idle_wait = max(0, idle_wait - current_delay)
-                    timing["waiting_at_node_minutes"] = new_idle_wait
-                    timing["wait_minutes"]            = service_time  # el servicio siempre toma lo mismo
-                    current_delay                     = max(0, current_delay - idle_wait)
-
-                    timing["etd_clock"] = _add_minutes_to_clock(timing.get("etd_clock"), current_delay)
-                    timing["departure_minutes_from_departure"] = max(0, (
-                        int(timing.get("departure_minutes_from_departure") or 0)
-                        - (optimal_delay - current_delay)
-                    ))
-                    if timing.get("deadline_slack_minutes") is not None:
-                        timing["deadline_slack_minutes"] = int(timing["deadline_slack_minutes"]) - optimal_delay
-
-                trip["return_clock"]       = _add_minutes_to_clock(trip.get("return_clock"), current_delay)
-                time_saved                 = optimal_delay - current_delay
-                trip["duration_minutes"]   = int(trip.get("duration_minutes") or 0) - time_saved
-                trip["time_minutes_total"] = int(trip.get("time_minutes_total") or 0) - time_saved
-                vdata["total_time_minutes_total"] = trip["time_minutes_total"]
-
-        # Max/avg después del fine-tuning
+        # Max/avg de las jornadas
         max_vehicle_time_total = 0
         max_vehicle_time_drive = 0
         for vdata in vehicle_trips.values():

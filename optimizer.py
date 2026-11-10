@@ -263,9 +263,19 @@ def _group(identificador: str) -> str:
     return "OTHER"
 
 
-def _es_la_vega(identificador: str) -> bool:
-    # La misma regla que `is_lv_node` en construir_modelo.
-    return "LA VEGA" in (identificador or "").upper()
+# ── Los que pueden ir con Cencosud CD (pedido del usuario, 10-11-2026) ─────
+# Punto Azul y La Vega pueden ir en el mismo viaje que Cencosud CD, SIEMPRE
+# ANTES que el CD: Punto Azul + Cencosud, La Vega + Cencosud o Punto Azul +
+# La Vega + Cencosud. Después de Cencosud CD el camión no visita a ninguno de
+# los dos (en construir_modelo: un arco de Cencosud CD a uno de ellos no
+# existe). Fuera de eso son locales del resto como cualquier otro.
+ACOMPANANTES_DE_CENCOSUD = ("PUNTO AZUL", "LA VEGA")
+
+
+def _acompana_a_cencosud(identificador: str) -> bool:
+    # La misma regla que `is_pa_node` / `is_lv_node` en construir_modelo.
+    ident = (identificador or "").upper()
+    return any(tag in ident for tag in ACOMPANANTES_DE_CENCOSUD)
 
 
 # ── Zonas (pedido del usuario, 13-10-2026) ─────────────────────────────────
@@ -323,24 +333,24 @@ def _grupos_de_clientes(nodos):
     """Grupos por cliente de una lista de nodos [(índice, identificador)].
 
     Walmart CD y Cencosud CD van solos y
-    el resto junto ("OTHER"), como en el modelo. La Vega es la excepción: el
-    modelo la deja ir en modo libre O en el de Cencosud (ver `allowed` en
-    construir_modelo), así que no abre un grupo propio si ya hay resto o
-    Cencosud; sólo lo abre, como resto, cuando no hay ninguno de los dos.
+    el resto junto ("OTHER"), como en el modelo. Punto Azul y La Vega son la
+    excepción: el modelo los deja ir en modo libre O en el de Cencosud (ver
+    `allowed` en construir_modelo), así que no abren un grupo propio si ya hay
+    resto o Cencosud; sólo lo abren, como resto, cuando no hay ninguno de los dos.
 
     Antes La Vega contaba siempre como resto, y La Vega + Cencosud CD con un
     solo camión se rechazaba con GRUPOS_EXCEDEN_CAMIONES aunque el modelo sí
     la resolvía (las dos en el mismo viaje, en modo Cencosud).
     """
-    grupos, la_vega = {}, []
+    grupos, acompanantes = {}, []
     for i, ident in nodos:
-        if _group(ident) == "OTHER" and _es_la_vega(ident):
-            la_vega.append(i)
+        if _group(ident) == "OTHER" and _acompana_a_cencosud(ident):
+            acompanantes.append(i)
         else:
             grupos.setdefault(_group(ident), []).append(i)
-    if la_vega:
+    if acompanantes:
         destino = "CENCOSUD" if ("CENCOSUD" in grupos and "OTHER" not in grupos) else "OTHER"
-        grupos.setdefault(destino, []).extend(la_vega)
+        grupos.setdefault(destino, []).extend(acompanantes)
     return grupos
 
 
@@ -356,10 +366,10 @@ def modos_necesarios(locations, modo_free, modo_w, modo_c):
       · Walmart  → hay locales del grupo WALMART
       · Cencosud → hay locales del grupo CENCOSUD
       · libre    → hay locales del resto
-    (La Vega cuenta aquí como resto y abre el modo libre aunque también puede
-    ir en el de Cencosud: a lo más sobra un modo, que el solver no usa. Para
-    contar cuántos camiones hacen falta sí se la junta con Cencosud: ver
-    `_grupos_por_camion`.)
+    (Punto Azul y La Vega cuentan aquí como resto y abren el modo libre aunque
+    también pueden ir en el de Cencosud: a lo más sobra un modo, que el solver
+    no usa. Para contar cuántos camiones hacen falta sí se los junta con
+    Cencosud: ver `_grupos_por_camion`.)
     """
     grupos = {_group(loc.get("identificador", "")) for loc in locations[1:]}
     modos = []
@@ -535,7 +545,8 @@ def revisar_factibilidad(ctx, diag):
              else "Hay más grupos excluyentes de locales que camiones disponibles."),
             detalle=([nota_zonas] if zonas is not None else []) + [
                 "Walmart y Cencosud no pueden ir en el mismo viaje que otros clientes "
-                "(La Vega sí puede ir con Cencosud), así que cada grupo necesita su propio camión.",
+                "(Punto Azul y La Vega sí pueden ir con Cencosud, antes que el CD), "
+                "así que cada grupo necesita su propio camión.",
                 f"Grupos en esta ruta: {len(grupos)}. Camiones seleccionados: {ctx['base_num_vehicles']}.",
             ] + detalle,
             sugerencias=[
@@ -816,7 +827,8 @@ RELAJACIONES = [
      ["Selecciona más camiones refrigerados.",
       "O deja los locales que exigen frío para otra ruta."]),
     ("grupos", "GRUPOS_EXCLUSIVOS",
-     "La regla de que Walmart y Cencosud viajen separados impide armar la ruta.",
+     "La regla de que Walmart y Cencosud viajen separados (y de que Punto Azul y La Vega "
+     "vayan antes que Cencosud CD cuando comparten camión) impide armar la ruta.",
      ["Selecciona un camión más para que cada grupo tenga el suyo.",
       "O arma rutas distintas para Walmart y Cencosud."]),
 ]
@@ -884,6 +896,14 @@ def _motivo_probable_del_descarte(i, ctx):
             ctx["node_zona_clase"][i], "de su zona")
         return (f"no encaja junto con el resto de las paradas {zona} dentro de los tiempos disponibles "
                 f"(no se mezclan zonas: permitirlo en los ajustes del algoritmo puede destrabarlo)")
+
+    # Punto Azul / La Vega en una ruta con Cencosud CD: en el camión del CD
+    # solo pueden ir ANTES que el CD, y eso puede no alcanzar su horario.
+    grupos = ctx.get("node_group") or []
+    if (_acompana_a_cencosud(loc.get("identificador", "")) and "CENCOSUD" in grupos
+            and (i >= len(grupos) or grupos[i] == "OTHER")):
+        return ("no encaja dentro de los tiempos disponibles: en el camión de Cencosud CD solo puede ir "
+                "antes que el CD y así no se alcanza; con un camión más puede ir aparte")
 
     return "no encaja junto con el resto de las paradas dentro de los tiempos disponibles"
 
@@ -1612,6 +1632,11 @@ def optimize():
                 is_nicolas_palma_node.append(
                     "NICOLAS PALMA" in ident or "NICOLÁS PALMA" in ident
                 )
+            # Punto Azul y La Vega: pueden ir con Cencosud CD, antes que el CD.
+            acompana_a_cencosud = [
+                node_group[i] == "OTHER" and _acompana_a_cencosud(loc.get("identificador", ""))
+                for i, loc in enumerate(extended_locations)
+            ]
 
             MODE_FREE, MODE_W, MODE_C = 0, 1, 2
             if "grupos" not in relajar:
@@ -1623,7 +1648,7 @@ def optimize():
                     elif g == "CENCOSUD":
                         allowed = {MODE_C}
                     else:
-                        if is_lv_node[node_index]:
+                        if acompana_a_cencosud[node_index]:
                             allowed = {MODE_FREE, MODE_C}
                         else:
                             allowed = {MODE_FREE}
@@ -1663,28 +1688,23 @@ def optimize():
 
 
 
-            enforce_lv_first_hard = data.get("enforce_lv_first_hard", False)
-
-            if enforce_lv_first_hard:
-                for v in range(num_vehicles):
-                    if vehicle_mode[v] == MODE_C: 
-                        start_idx = routing.Start(v)
-                        lv_indices = [manager.NodeToIndex(i) for i in range(1, num_nodes) if is_lv_node[i]]
-                        cencosud_indices = [manager.NodeToIndex(i) for i in range(1, num_nodes) 
-                                           if node_group[i] == "CENCOSUD"]
-
-                        for lv_idx in lv_indices:
-                            lv_node = manager.IndexToNode(lv_idx)
-                            for cenc_idx in cencosud_indices:
-                                cenc_node = manager.IndexToNode(cenc_idx)
-                                if cenc_node == lv_node:
-                                    continue
-
-                                lv_active = routing.ActiveVar(lv_idx)
-                                cenc_active = routing.ActiveVar(cenc_idx)
-                                lv_next_var = routing.NextVar(start_idx)
-                                solver.Add((lv_active + cenc_active - 1) <= 
-                                         solver.IsEqualCstVar(lv_next_var, lv_idx))
+            # ── Punto Azul y La Vega van ANTES que Cencosud CD ──
+            # En un viaje de Cencosud solo hay Cencosud CD (y sus partes, si se
+            # dividió) y Punto Azul / La Vega. Sin ningún arco de un Cencosud CD
+            # a uno de ellos, ninguno puede quedar después de un Cencosud: el
+            # primero que lo hiciera tendría a un Cencosud justo antes. Es regla
+            # dura (antes La Vega después del CD solo costaba una multa, y
+            # `enforce_lv_first_hard`, que nadie mandaba, exigía que La Vega
+            # fuera la PRIMERA parada de todo vehículo de Cencosud).
+            if "grupos" not in relajar:
+                acompanantes_idx = [manager.NodeToIndex(i) for i in range(1, num_nodes)
+                                    if acompana_a_cencosud[i]]
+                for c in range(1, num_nodes):
+                    if node_group[c] != "CENCOSUD":
+                        continue
+                    siguiente = routing.NextVar(manager.NodeToIndex(c))
+                    for x_idx in acompanantes_idx:
+                        siguiente.RemoveValue(x_idx)
 
             any_pa_exists = any(is_pa_node[1:])
             any_lv_exists = any(is_lv_node[1:])
@@ -1759,19 +1779,14 @@ def optimize():
 
                         if from_node != depot and to_node != depot:
                             g_from, g_to = node_group[from_node], node_group[to_node]
-                            is_lv_exception = (
-                                (is_lv_node[from_node] and g_to == "CENCOSUD") or
-                                (g_from == "CENCOSUD" and is_lv_node[to_node])
-                            )
+                            # Punto Azul / La Vega → Cencosud CD no es mezclar
+                            # grupos: es el orden permitido. Al revés el arco ni
+                            # existe (ver «van ANTES que Cencosud CD»).
+                            antes_de_cencosud = acompana_a_cencosud[from_node] and g_to == "CENCOSUD"
 
-                            if not is_lv_exception:
+                            if not antes_de_cencosud:
                                 if g_from != g_to and ("WALMART" in (g_from, g_to) or "CENCOSUD" in (g_from, g_to)):
                                     base += HIGH_PENALTY
-
-                        if vehicle_mode[v_idx] == MODE_C:
-                            if to_node != depot and is_lv_node[to_node]:
-                                if from_node != depot and node_group[from_node] == "CENCOSUD":
-                                    base += 50_000 
 
                         return base
                     return distance

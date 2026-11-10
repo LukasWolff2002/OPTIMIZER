@@ -124,6 +124,13 @@ palets en silencio.
 - **Todos los locales son obligatorios.** No hay disyunciones en la corrida real:
   si un solo local es imposible, no hay ruta. Por eso el diagnóstico las usa
   para señalarlo.
+- **Grupos excluyentes por viaje**: Walmart CD solo; Cencosud CD solo o con
+  **Punto Azul y/o La Vega, siempre antes que el CD** (Punto Azul + Cencosud,
+  La Vega + Cencosud, Punto Azul + La Vega + Cencosud); el resto, mezclable.
+  El orden es regla dura: no existe el arco de un Cencosud CD a Punto Azul o
+  La Vega (`ACOMPANANTES_DE_CENCOSUD`). Antes solo La Vega podía ir con
+  Cencosud, y quedar después del CD costaba una multa, no lo impedía. Se quitó
+  `enforce_lv_first_hard`, que la app no enviaba.
 - **Los vehículos virtuales se generan por grupo presente** (`modos_necesarios`):
   una ruta sin locales de Walmart no crea el modo Walmart. Antes eran siempre 3
   por camión. Medido: misma ruta y mismo tiempo, ~10–17% menos memoria del modelo.

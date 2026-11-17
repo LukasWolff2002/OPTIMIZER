@@ -35,6 +35,7 @@ OptimizerController#create
 | `fecha` | **Nuevo.** Fecha de la ruta. Sin ella se usaba la del servidor (UTC), y las reglas por día de la semana salían mal |
 | `max_time_per_trip` | Horizonte de conducción por camión. Por defecto 480 min — hoy la app **no lo envía** |
 | `job_id` | Id de la `OptimizerRequest`, para publicar el progreso en Redis |
+| `locations[].retiro` | **Nuevo (17-11-2026).** Lo que el camión va a BUSCAR al local: `{"kg", "palets", "minutos", "lineas"}`. Ver «Retiros» |
 
 ## Contrato de salida
 
@@ -60,6 +61,66 @@ Cada asignación trae además, cuando el cálculo movió la salida:
 `OptimizerJob` guarda todo eso en `optimizer_requests.error_details` y lo
 muestran la pantalla de "Procesando", el índice del optimizador y "Última
 solicitud".
+
+## Retiros (17-11-2026)
+
+Una parada puede ser de **retiro**: el camión va a buscar cajas de despacho,
+envases u otra cosa. El plan completo está en la app (`bd_teruel`,
+`docs/PLAN_PARADAS_DE_RETIRO.md`, §4 y las decisiones D1, D5, D6 y D7).
+
+**Entrada.** Cada local de `locations[]` puede traer, además de `demanda`:
+
+```json
+"retiro": {"kg": 750.0, "palets": 4, "minutos": 40,
+           "lineas": [{"clase": "envase", "envase_id": 3, "nombre": "Clamshell 250 g",
+                       "cantidad": 30000, "kg": 750.0, "palets": 4.0}]}
+```
+
+El servicio usa `kg`, `palets` y `minutos` (los de carga: el tope de espera
+no los recorta) y devuelve `lineas` tal como llegaron. Un local con `retiro` y
+sin productos es **sólo de retiro**: no da una parada de entrega vacía (un
+local sin productos y sin retiro se sigue visitando, como siempre).
+
+**Reglas.**
+
+- **Un nodo de retiro por local**, con la fila del local en las matrices, su
+  horario y sus tolerancias. Va después de todos los nodos de entrega.
+- **Primero se entrega, después se retira (D1).** No existe el arco de un
+  retiro a una entrega: en un camión, ninguna entrega va después de un retiro.
+  Si un local tiene entrega y retiro, el retiro va después de TODAS las
+  entregas del camión, no necesariamente justo después de la suya.
+- **Espacio aparte.** Dos dimensiones, `RetiroKg` y `RetiroPalets`, con los kg
+  y los palets del camión: cuando empieza a cargar, lo entregado ya bajó.
+- **Neutro (D5).** Entra en cualquier modo (libre, Walmart, Cencosud), no abre
+  uno propio, no paga la multa de mezclar grupos ni las de primera parada.
+  Un camión de Walmart puede retirar a la vuelta. Sin mezclar zonas, respeta
+  la zona de su local. Nunca exige frío.
+- **Cuenta como parada (D6)** y su desvío entra en las horas de conducción.
+- **Opcional (D7).** Cada retiro va en una disyunción con la multa de descarte
+  (10⁹): el solver lo deja fuera sólo si no cabe. Las entregas siguen siendo
+  obligatorias.
+- **Un retiro no se parte.** Si no cabe entero (kg y palets) en ningún camión,
+  es el error `RETIRO_MAS_GRANDE_QUE_EL_CAMION`, antes de calcular.
+
+**Salida.**
+
+- Cada parada de `trips[].deliveries[]` trae `"tipo": "entrega"` o `"retiro"`.
+  La de retiro trae además `"retiro"` (el eco), `products: {}`,
+  `products_detail: []`, `totals.kg = 0`, `group: "RETIRO"` y sus horas como
+  cualquier parada (`timing.wait_minutes` = los minutos de carga).
+- Por viaje: `num_retiros`, `total_kg_retiro`, `total_palets_retiro`; por
+  camión y en `totals`: `total_kg_retiro` y `total_palets_retiro`. Nunca se
+  suman a `total_kg` ni a `total_palets`.
+- `retiros_sin_planificar`: los que quedaron fuera, con `location_id`,
+  `identificador`, `local`, `zona`, el eco de `retiro` y el `motivo` (el
+  horario, el espacio, el máximo de paradas, la conducción o la zona). Cada uno
+  va también en `avisos`. **Viene siempre, vacía si no hay**: así la app sabe
+  que el servicio conoce los retiros.
+- `meta.retiros`: `{"pedidos": n, "planificados": m}`.
+
+**Despliegue.** Este servicio va ANTES que la app que manda retiros: uno viejo
+ignoraría `retiro` y visitaría el local como una entrega vacía. Sin retiros en
+la solicitud, la respuesta es la de siempre más las claves nuevas en cero.
 
 ## Cómo se explica un fallo
 
@@ -93,7 +154,15 @@ no "es imposible": son problemas distintos con soluciones opuestas.
 `PARADAS_INSUFICIENTES` · `VENTANAS_IMPOSIBLES` · `LOCALES_IMPOSIBLES` ·
 `TIEMPO_DE_CALCULO_INSUFICIENTE` · `VENTANAS_HORARIAS` · `TIEMPOS_DE_ESPERA` ·
 `HORIZONTE_CONDUCCION` · `MAXIMO_DE_PARADAS` · `PALETS` · `CAPACIDAD_KG` ·
-`REFRIGERACION` · `GRUPOS_EXCLUSIVOS` · `SIN_SOLUCION` · `ERROR_INTERNO`
+`REFRIGERACION` · `GRUPOS_EXCLUSIVOS` · `SIN_SOLUCION` · `ERROR_INTERNO` ·
+`RETIRO_MAS_GRANDE_QUE_EL_CAMION` · `RETIRO_INVALIDO`
+
+Avisos (la ruta sale igual): `RETIROS_EXCEDEN_LA_FLOTA` (los retiros juntos
+pasan de la flota: alguno va a quedar fuera) y `RETIRO_SIN_PLANIFICAR`.
+
+Las revisiones previas y el diagnóstico miran sólo las ENTREGAS: un retiro es
+opcional, así que nunca es lo que impide la ruta. Un retiro con un horario
+imposible no es `VENTANAS_IMPOSIBLES`: queda fuera con ese motivo.
 
 ## Cómo probarlo local
 
@@ -110,6 +179,21 @@ with optimizer.app.test_client() as c:
 
 `data_input.json` trae un `curl` con un payload real de ejemplo (4 locales,
 2 camiones) del que se puede extraer el JSON.
+
+### Pruebas
+
+```bash
+pip install pytest
+python3 -m pytest tests -q
+```
+
+`tests/test_retiros.py` (16 pruebas, ~15 s) parte de ese mismo payload con 1 s
+de búsqueda: sin retiros sale como siempre; el retiro va al final del camión,
+no suma a la carga y vuelve con su eco; entrega y retiro en el mismo local;
+sólo retiros con camiones sin frío; un camión de Walmart que retira; los
+minutos de carga sin recortar; el retiro más grande que el camión (kg y
+palets); los que quedan fuera por espacio, por horario, por el máximo de
+paradas, por «primero entregar» y por la zona; y un retiro mal formado.
 
 ## Puntos críticos y plan de mejora
 

@@ -1,6 +1,7 @@
 from flask import Flask, Response, request, jsonify
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import copy
+import math
 import os
 import json
 import queue
@@ -233,6 +234,14 @@ def _num(x, dec=0):
     return s.replace(",", "@").replace(".", ",").replace("@", ".")
 
 
+def _num_justo(x, dec=1):
+    """Como _num, pero sin decimales cuando el número es entero: «900 kg», «2,5 palets»."""
+    try:
+        return _num(x) if float(x).is_integer() else _num(x, dec)
+    except Exception:
+        return str(x)
+
+
 def _nombre_local(loc, idx=None):
     ident = (loc.get("identificador") or "").strip()
     lid = loc.get("id")
@@ -299,6 +308,89 @@ def _leer_bool(valor, por_defecto):
     if valor is None:
         return por_defecto
     return bool(valor) and str(valor).strip().lower() not in ("false", "0", "")
+
+
+# ── Retiros (17-11-2026, docs/PLAN_PARADAS_DE_RETIRO.md de bd_teruel, §4) ───
+# Un local puede traer, además de `demanda`, un objeto `retiro` con lo que el
+# camión va a BUSCAR (cajas de despacho, envases u otra cosa):
+#   "retiro": {"kg": 750.0, "palets": 4, "minutos": 40, "lineas": [...]}
+# El servicio usa kg, palets y minutos; las líneas vuelven tal como llegaron.
+# Reglas (decisiones del plan):
+#   · un nodo de retiro propio, con la fila del local en las matrices; un local
+#     solo de retiro no da un nodo de entrega vacío;
+#   · primero se entrega y después se retira (D1): no existe el arco de un
+#     retiro a una entrega, así que en un camión ninguna entrega va después de
+#     un retiro;
+#   · lo retirado cabe por separado, en los kg y los palets del camión: cuando
+#     empieza a cargar, lo entregado ya bajó;
+#   · neutro para los grupos (D5): entra en cualquier modo, no abre uno propio,
+#     no paga la multa de mezclar grupos ni las de primera parada; sin mezclar
+#     zonas, respeta la zona de su local; nunca exige frío;
+#   · cuenta como parada (D6) y su desvío entra en las horas de conducción;
+#   · es OPCIONAL (D7): va en una disyunción con la multa de descarte; el que no
+#     cabe queda en `retiros_sin_planificar` con su motivo y no deja la ruta
+#     sin solución. Las entregas siguen siendo obligatorias.
+# Los minutos del retiro son los de carga que escribió quien arma la ruta: el
+# tope de espera (limitar_espera) no los recorta.
+GRUPO_RETIRO = "RETIRO"
+
+
+def _numero_no_negativo(valor, campo, nombre):
+    if valor is None or valor == "":
+        return 0.0
+    try:
+        numero = float(str(valor).replace(",", ".")) if isinstance(valor, str) else float(valor)
+    except (TypeError, ValueError):
+        raise ErrorOptimizacion(
+            "RETIRO_INVALIDO",
+            "Un retiro llegó con datos que no se entienden.",
+            detalle=[f"{nombre}: «{campo}» del retiro es «{valor}» y tiene que ser un número."],
+            sugerencias=["Es un error de la aplicación, no de los datos que cargaste. Reporta el problema."],
+            datos={"local": nombre, "campo": campo},
+        )
+    if numero != numero or numero in (float("inf"), float("-inf")):
+        numero = 0.0
+    return max(0.0, numero)
+
+
+def _leer_retiro(loc, idx=None):
+    """El retiro de un local, normalizado, o None si no trae uno."""
+    retiro = loc.get("retiro")
+    if retiro in (None, False, {}, ""):
+        return None
+    nombre = _nombre_local(loc, idx)
+    if not isinstance(retiro, dict):
+        raise ErrorOptimizacion(
+            "RETIRO_INVALIDO",
+            "Un retiro llegó con datos que no se entienden.",
+            detalle=[f"{nombre}: el retiro tiene que ser un objeto con kg, palets y minutos."],
+            sugerencias=["Es un error de la aplicación, no de los datos que cargaste. Reporta el problema."],
+            datos={"local": nombre},
+        )
+    lineas = retiro.get("lineas") or []
+    return {
+        "kg": _numero_no_negativo(retiro.get("kg"), "kg", nombre),
+        "palets": _numero_no_negativo(retiro.get("palets"), "palets", nombre),
+        "minutos": _numero_no_negativo(retiro.get("minutos"), "minutos", nombre),
+        "lineas": lineas if isinstance(lineas, list) else [],
+    }
+
+
+def _pide_entrega(loc):
+    """El local pide algún producto (alguna cantidad mayor que 0)."""
+    for cantidad in (loc.get("demanda") or {}).values():
+        try:
+            if float(str(cantidad).replace(",", ".")) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _solo_retiro(loc):
+    """Local que sólo va a retirar: no da un nodo de entrega vacío. Un local
+    sin demanda y SIN retiro se sigue visitando, como siempre."""
+    return _leer_retiro(loc) is not None and not _pide_entrega(loc)
 
 
 def _etiqueta_grupo(g, resto="el resto de los locales"):
@@ -370,8 +462,11 @@ def modos_necesarios(locations, modo_free, modo_w, modo_c):
     también pueden ir en el de Cencosud: a lo más sobra un modo, que el solver
     no usa. Para contar cuántos camiones hacen falta sí se los junta con
     Cencosud: ver `_grupos_por_camion`.)
+
+    Un local SOLO de retiro no abre modo: el retiro es neutro y va en el modo
+    que el camión ya tenga. Si no hay ninguna entrega, queda el modo libre.
     """
-    grupos = {_group(loc.get("identificador", "")) for loc in locations[1:]}
+    grupos = {_group(loc.get("identificador", "")) for loc in locations[1:] if not _solo_retiro(loc)}
     modos = []
     if "OTHER" in grupos:
         modos.append(modo_free)
@@ -432,6 +527,10 @@ def revisar_estructura(data, truck_ids, diag):
             detalle=["Sin tiempos de viaje no se pueden respetar los horarios de atención de los locales."],
             sugerencias=["Recalcula las matrices desde Ubicaciones (botón de recalcular) y reintenta."],
         )
+
+    # Un retiro mal formado se rechaza aquí, antes de armar nada.
+    for i, loc in enumerate(locations[1:], start=1):
+        _leer_retiro(loc, i)
 
     faltan_coord = [_nombre_local(l, i) for i, l in enumerate(locations)
                     if l.get("lat") in (None, "") or l.get("lng") in (None, "")]
@@ -532,12 +631,17 @@ def revisar_factibilidad(ctx, diag):
     def _nodo(i):
         return (i, _ident(i)) if zonas is None else (i, _ident(i), zonas[i])
 
+    # Los retiros son opcionales y neutros (no abren grupo ni piden camión):
+    # las revisiones de abajo miran sólo las entregas.
+    es_retiro = ctx.get("es_retiro") or [False] * ctx["num_nodes"]
+    entregas = [i for i in range(1, ctx["num_nodes"]) if not es_retiro[i]]
+
     nota_zonas = ("No se mezclan zonas: un camión que va a la Región Metropolitana no reparte en otras "
                   "zonas, así que cada zona necesita su propio camión.")
-    grupos = _grupos_por_camion([_nodo(i) for i in range(1, ctx["num_nodes"])])
+    grupos = _grupos_por_camion([_nodo(i) for i in entregas])
     if len(grupos) > ctx["base_num_vehicles"]:
         detalle = [f"{_etiqueta_grupo(g)}: {len(v)} local(es)." for g, v in sorted(grupos.items())]
-        sin_zonas = len(_grupos_por_camion([(i, _ident(i)) for i in range(1, ctx["num_nodes"])]))
+        sin_zonas = len(_grupos_por_camion([(i, _ident(i)) for i in entregas]))
         por_zonas = zonas is not None and sin_zonas <= ctx["base_num_vehicles"]
         problemas.append(ErrorOptimizacion(
             "ZONAS_EXCEDEN_CAMIONES" if por_zonas else "GRUPOS_EXCEDEN_CAMIONES",
@@ -595,7 +699,9 @@ def revisar_factibilidad(ctx, diag):
             ))
 
     # ── Máximo de paradas ─────────────────────────────────────────────────
-    paradas_necesarias = ctx["num_nodes"] - 1
+    # Sólo las entregas, que son obligatorias: un retiro que no alcanza a
+    # entrar queda fuera con su motivo (D7), no deja la ruta sin solución.
+    paradas_necesarias = len(entregas)
     paradas_posibles = ctx["maximo_de_paradas"] * ctx["base_num_vehicles"]
     if paradas_necesarias > paradas_posibles:
         problemas.append(ErrorOptimizacion(
@@ -613,6 +719,58 @@ def revisar_factibilidad(ctx, diag):
             ],
             datos={"paradas_necesarias": paradas_necesarias, "paradas_posibles": paradas_posibles},
         ))
+
+    # ── Retiros ───────────────────────────────────────────────────────────
+    # Un retiro no se parte: tiene que caber entero (kg y palets) en algún
+    # camión. Uno que no cabe en ninguno es un error de los datos (§4.4 del
+    # plan): se dice antes de calcular, con el nombre del local. Que todos los
+    # retiros juntos pasen de la flota NO es un error (D7): los que no quepan
+    # quedan fuera con su motivo; aquí sólo se avisa.
+    retiros = [i for i in range(1, ctx["num_nodes"]) if es_retiro[i]]
+    if retiros:
+        inf = ctx["PALLET_INF"]
+        camiones = list(zip(ctx["vehicle_capacities_base"], ctx["vehicle_palets_base"]))
+
+        def _cabe(i):
+            kg, pal = ctx["retiro_kg"][i], ctx["retiro_palets"][i]
+            return any(kg <= cap and (p >= inf or pal <= p) for cap, p in camiones)
+
+        grandes = [i for i in retiros if not _cabe(i)]
+        if grandes:
+            cap_max = max(ctx["vehicle_capacities_base"], default=0)
+            limitados = [p for p in ctx["vehicle_palets_base"] if p < inf]
+            flota = (f"El camión más grande lleva {_num(cap_max)} kg"
+                     + (f"; el de más palets, {max(limitados)} palets." if len(limitados) == len(camiones) and limitados
+                        else "."))
+            problemas.append(ErrorOptimizacion(
+                "RETIRO_MAS_GRANDE_QUE_EL_CAMION",
+                ("Hay un retiro que no cabe en ningún camión seleccionado." if len(grandes) == 1
+                 else f"Hay {len(grandes)} retiros que no caben en ningún camión seleccionado."),
+                detalle=["Un retiro no se parte: tiene que caber entero, en kilos y en palets, en un camión."]
+                        + [f"{_nombre_local(ctx['extended_locations'][i], i)}: {_num_justo(ctx['retiro_kg'][i])} kg y "
+                           f"{_num_justo(ctx['retiro_palets'][i])} palets." for i in grandes]
+                        + [flota],
+                sugerencias=[
+                    "Selecciona un camión más grande.",
+                    "O baja lo que se retira en ese local y deja el resto para otra ruta.",
+                ],
+                datos={"retiros": [_nombre_local(ctx["extended_locations"][i], i) for i in grandes],
+                       "capacidad_max_kg": cap_max},
+            ))
+
+        kg_retiros = sum(ctx["retiro_kg"][i] for i in retiros)
+        kg_flota = sum(ctx["vehicle_capacities_base"])
+        if kg_retiros > kg_flota:
+            diag.aviso("RETIROS_EXCEDEN_LA_FLOTA",
+                       f"Los retiros suman {_num(kg_retiros)} kg y la flota lleva {_num(kg_flota)} kg: "
+                       f"alguno va a quedar fuera de la ruta.")
+        palets_retiros = sum(ctx["retiro_palets"][i] for i in retiros)
+        if all(p < inf for p in ctx["vehicle_palets_base"]):
+            palets_flota = sum(ctx["vehicle_palets_base"])
+            if palets_retiros > palets_flota:
+                diag.aviso("RETIROS_EXCEDEN_LA_FLOTA",
+                           f"Los retiros ocupan {_num_justo(palets_retiros)} palets y la flota lleva "
+                           f"{_num(palets_flota)}: alguno va a quedar fuera de la ruta.")
 
     return problemas
 
@@ -733,8 +891,13 @@ def revisar_ventanas(ctx, diag):
     tiempos_desde_deposito = ctx["extended_time_matrix"][0] if ctx["extended_time_matrix"] else None
     salida_min = min([o for o in ctx["vehicle_start_offsets_base"] if o is not None], default=0)
     antes_de_abrir = ctx.get("antes_de_abrir") or [False] * ctx["num_nodes"]
+    es_retiro = ctx.get("es_retiro") or [False] * ctx["num_nodes"]
 
     for i in range(1, ctx["num_nodes"]):
+        # Un retiro con un horario imposible no deja la ruta sin solución (D7):
+        # queda fuera y `retiros_sin_planificar` dice por qué.
+        if es_retiro[i]:
+            continue
         loc = ctx["extended_locations"][i]
         nombre = _nombre_local(loc, i)
         apertura = ctx["extended_opening"][i]
@@ -908,6 +1071,101 @@ def _motivo_probable_del_descarte(i, ctx):
     return "no encaja junto con el resto de las paradas dentro de los tiempos disponibles"
 
 
+def _motivo_del_retiro_sin_planificar(i, ctx, rutas, camiones_libres):
+    """Por qué el retiro del nodo `i` quedó fuera de la ruta (D7).
+
+    Se mira lo que podría haberlo hecho: cada camión de la solución, pasando
+    después de su última entrega (D1), y cada camión que no salió, desde el
+    packing. Primero el horario, después el espacio, las paradas y la
+    conducción; el primero que ningún camión cumple es el motivo.
+
+    rutas: [{"zona", "ultima_entrega", "sale_de_ultima_entrega", "ultimo",
+             "kg_libre", "palets_libre", "paradas_libres", "conduccion"}]
+    camiones_libres: [(camión, minuto de salida)] los que no salieron.
+    """
+    tiempos = ctx["extended_time_matrix"]
+    ref = ctx["reference_departure_minutes"]
+    zonas = ctx.get("node_zona_clase")
+    inf = ctx["PALLET_INF"]
+    kg, pal = ctx["retiro_kg"][i], ctx["retiro_palets"][i]
+    minutos = int(round(ctx["extended_wait"][i]))
+
+    candidatos = []
+    for r in rutas:
+        if zonas is not None and r["zona"] is not None and r["zona"] != zonas[i]:
+            continue  # sin mezclar zonas, sólo los camiones de su zona
+        ultimo = r["ultimo"]
+        desvio = int(round(tiempos[ultimo][i] + tiempos[i][0] - tiempos[ultimo][0]))
+        candidatos.append({
+            "llegada": r["sale_de_ultima_entrega"] + int(round(tiempos[r["ultima_entrega"]][i])),
+            "kg_libre": r["kg_libre"], "palets_libre": r["palets_libre"],
+            "paradas_libres": r["paradas_libres"], "conduccion": r["conduccion"] + desvio,
+        })
+    for base, salida in camiones_libres:
+        palets = ctx["vehicle_palets_base"][base]
+        candidatos.append({
+            "llegada": int(salida or 0) + int(round(tiempos[0][i])),
+            "kg_libre": ctx["vehicle_capacities_base"][base],
+            "palets_libre": None if palets >= inf else palets,
+            "paradas_libres": ctx["maximo_de_paradas"],
+            "conduccion": int(round(tiempos[0][i] + tiempos[i][0])),
+        })
+    if not candidatos:
+        return "ningún camión de su zona pasa por ahí y no queda un camión libre para ir a retirar"
+
+    # 1) El horario: el tope de llegada es el de una entrega (cierre −
+    #    tolerancia − carga), o la apertura si la carga dura más que el horario.
+    tope = None
+    apertura, cierre = ctx["extended_opening"][i], ctx["extended_deadline"][i]
+    antes = (ctx.get("antes_de_abrir") or [False] * ctx["num_nodes"])[i]
+    tolerancia = max(0, int(ctx["extended_closing_gap"][i] or 0))
+    if ref is not None:
+        if antes and apertura is not None:
+            tope = int(apertura)
+        elif cierre is not None:
+            t = int(cierre) - tolerancia - minutos
+            tope = t if t > 0 else None
+    a_tiempo = [c for c in candidatos if tope is None or c["llegada"] <= tope]
+    if not a_tiempo:
+        primero = _fmt_hhmm(ref + min(c["llegada"] for c in candidatos))
+        if antes:
+            return (f"la carga ({minutos} min) dura más que su horario, así que hay que llegar antes de que abra "
+                    f"({_fmt_hhmm(ref + tope)}), y el primer camión que puede pasar después de sus entregas "
+                    f"llega a las {primero}")
+        # La tolerancia del cierre se dice: sin ella, «12:00 − 30 min» no da
+        # las 11:20 que exige (como en el motivo de una entrega).
+        con_tolerancia = f" y {tolerancia} min de tolerancia" if tolerancia else ""
+        return (f"cierra a las {_fmt_hhmm(ref + int(cierre))}: con {minutos} min de carga{con_tolerancia} hay que "
+                f"llegar antes de las {_fmt_hhmm(ref + tope)}, y el primer camión que puede pasar después de sus "
+                f"entregas llega a las {primero}")
+
+    # 2) El espacio, por separado de lo entregado.
+    def _cabe(c):
+        return c["kg_libre"] >= kg and (c["palets_libre"] is None or c["palets_libre"] >= pal)
+
+    con_espacio = [c for c in a_tiempo if _cabe(c)]
+    if not con_espacio:
+        mejor = max(a_tiempo, key=lambda c: (c["kg_libre"],
+                                             inf if c["palets_libre"] is None else c["palets_libre"]))
+        libre = (f"{_num(max(0, mejor['kg_libre']))} kg"
+                 + ("" if mejor["palets_libre"] is None else f" y {_num_justo(max(0, mejor['palets_libre']))} palets"))
+        return (f"no queda espacio: el retiro ocupa {_num_justo(kg)} kg y {_num_justo(pal)} palets, y al camión con más "
+                f"lugar que alcanza a llegar le quedan {libre} después de sus otros retiros")
+
+    # 3) Las paradas (D6: el retiro es una parada más).
+    con_parada = [c for c in con_espacio if c["paradas_libres"] >= 1]
+    if not con_parada:
+        return (f"los camiones que alcanzan a llegar y tienen espacio ya hacen el máximo de "
+                f"{ctx['maximo_de_paradas']} paradas")
+
+    # 4) Las horas de conducción.
+    if all(c["conduccion"] > ctx["HORIZON"] for c in con_parada):
+        return f"pasar a retirar dejaría a cada camión con más de {ctx['HORIZON']} min de conducción"
+
+    return ("no calza con los horarios y el espacio de los camiones después de sus entregas "
+            "(junto con sus otros retiros)")
+
+
 def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intento=8,
                                 estado_solver=None, tiempo_calculo=None):
     """Identifica QUÉ restricción bloquea la ruta y devuelve un ErrorOptimizacion.
@@ -941,12 +1199,16 @@ def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intent
             while not routing_d.IsEnd(idx):
                 visitados.add(manager_d.IndexToNode(idx))
                 idx = sol.Value(routing_d.NextVar(idx))
-        fuera = [i for i in range(1, ctx["num_nodes"]) if i not in visitados]
+        # Sólo las entregas: un retiro siempre se puede dejar fuera (es
+        # opcional), así que nunca es el que impide la ruta.
+        es_retiro = ctx.get("es_retiro") or [False] * ctx["num_nodes"]
+        entregas = [i for i in range(1, ctx["num_nodes"]) if not es_retiro[i]]
+        fuera = [i for i in entregas if i not in visitados]
 
         # Si quedan fuera TODOS los locales, el problema no es de un local
         # concreto sino una restricción global (horizonte, paradas, capacidad):
         # eso lo responde mejor la escalera de relajaciones de más abajo.
-        if fuera and len(fuera) == ctx["num_nodes"] - 1:
+        if fuera and len(fuera) == len(entregas):
             diag.info("DESCARTE_TOTAL",
                       "Ningún local es alcanzable: la causa es global, no de un local puntual.")
             fuera = []
@@ -1031,7 +1293,8 @@ def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intent
             "Se probó soltando cada restricción por separado (horarios, paradas, palets, "
             "capacidad, refrigeración, grupos) y ninguna por sí sola destraba el cálculo: "
             "hay varias condiciones apretadas a la vez.",
-            f"Locales: {ctx['num_nodes'] - 1} · camiones: {ctx['base_num_vehicles']} · "
+            f"Locales: {sum(1 for r in (ctx.get('es_retiro') or [False] * ctx['num_nodes'])[1:] if not r)} · "
+            f"camiones: {ctx['base_num_vehicles']} · "
             f"carga: {_num(sum(ctx['extended_demands'][1:]))} kg de "
             f"{_num(sum(ctx['vehicle_capacities_base']))} kg disponibles.",
         ],
@@ -1295,10 +1558,15 @@ def optimize():
         extended_opening     = [None]     
         extended_opening_gap = [0]        
         extended_closing_gap = [0]        
-        extended_refrigerate = [False]    
-        split_mapping        = {}         
+        extended_refrigerate = [False]
+        split_mapping        = {}
+        # El horario de cada local (apertura, cierre, tolerancias), para su
+        # nodo de retiro, que se arma después de todas las entregas.
+        ventana_por_local    = {}
 
         for idx_loc, loc in enumerate(locations[1:], start=1):
+            # Un local sólo de retiro no da un nodo de entrega vacío (§4.2).
+            solo_retiro = _solo_retiro(loc)
             prod_quantities = {
                 p: int(float(loc.get("demanda", {}).get(p, 0)))
                 for p in all_products
@@ -1310,7 +1578,7 @@ def optimize():
 
             wait_minutes = float(loc.get("wait_minutes", 0) or 0.0)
             wait_minutes = max(0.0, wait_minutes)
-            if wait_minutes > max_wait_minutes_cap:
+            if not solo_retiro and wait_minutes > max_wait_minutes_cap:
                 esperas_recortadas.append((_nombre_local(loc, idx_loc), wait_minutes, max_wait_minutes_cap))
                 wait_minutes = max_wait_minutes_cap
 
@@ -1377,6 +1645,10 @@ def optimize():
                 name in identificador for name in [s.upper() for s in ubicaciones_refrigeradas]
             )
 
+            ventana_por_local[idx_loc] = (opening_minutes_rel, deadline_minutes_rel, opening_gap, closing_gap)
+            if solo_retiro:
+                continue
+
             if total_demand <= max_vehicle_capacity:
                 extended_locations.append(loc)
                 extended_demands.append(int(total_demand))
@@ -1432,8 +1704,44 @@ def optimize():
                     remaining -= amount
                     remaining_palets -= palets_assigned
 
+        # ── Nodos de retiro (§4.2 del plan) ─────────────────────────────────
+        # Uno por local con `retiro`, DESPUÉS de todas las entregas (así los
+        # nodos de entrega quedan con el mismo índice que sin retiros). Usa la
+        # fila del local en las matrices (split_mapping), su horario y sus
+        # tolerancias; su tiempo en el local son los minutos de carga. No pide
+        # kilos ni palets de ENTREGA: lo suyo va en RetiroKg y RetiroPalets.
+        primer_retiro = len(extended_locations)
+        retiro_kg_nodo, retiro_palets_nodo, retiro_info_nodo = {}, {}, {}
+        for idx_loc, loc in enumerate(locations[1:], start=1):
+            retiro = _leer_retiro(loc, idx_loc)
+            if retiro is None:
+                continue
+            apertura_r, cierre_r, op_gap_r, cl_gap_r = ventana_por_local[idx_loc]
+            nodo_retiro = dict(loc)
+            nodo_retiro["demanda"] = {}
+            extended_locations.append(nodo_retiro)
+            extended_demands.append(0)
+            extended_palets.append(0.0)
+            extended_wait.append(retiro["minutos"])
+            extended_deadline.append(cierre_r)
+            extended_opening.append(apertura_r)
+            extended_opening_gap.append(op_gap_r)
+            extended_closing_gap.append(cl_gap_r)
+            extended_refrigerate.append(False)          # un retiro nunca exige frío
+            nodo = len(extended_locations) - 1
+            split_mapping[nodo] = idx_loc
+            retiro_kg_nodo[nodo] = retiro["kg"]
+            retiro_palets_nodo[nodo] = retiro["palets"]
+            retiro_info_nodo[nodo] = retiro
+
         num_nodes = len(extended_locations)
-        node_group = [_group(loc.get("identificador", "")) for loc in extended_locations]
+        es_retiro = [i >= primer_retiro for i in range(num_nodes)]
+        retiro_kg = [retiro_kg_nodo.get(i, 0.0) for i in range(num_nodes)]
+        retiro_palets = [retiro_palets_nodo.get(i, 0.0) for i in range(num_nodes)]
+        nodos_entrega = [i for i in range(1, num_nodes) if not es_retiro[i]]
+        nodos_retiro = [i for i in range(1, num_nodes) if es_retiro[i]]
+        node_group = [GRUPO_RETIRO if es_retiro[i] else _group(loc.get("identificador", ""))
+                      for i, loc in enumerate(extended_locations)]
         node_zona_clase = [_zona_clase(loc.get("zona")) for loc in extended_locations]
         # Locales cuya descarga dura más que su horario: se atienden si el camión
         # llega antes de que abran (el tope de llegada pasa a ser la apertura).
@@ -1449,7 +1757,10 @@ def optimize():
         def is_shared_warehouse_pair(from_node, to_node):
             if from_node == depot or to_node == depot:
                 return False
-            
+            # Un retiro tiene su propia carga y es su propia parada (D6).
+            if es_retiro[from_node] or es_retiro[to_node]:
+                return False
+
             # Extraemos los IDs de manera segura y los convertimos a string 
             # para evitar problemas si vienen como integer (ej. 6 vs "6")
             loc_from = extended_locations[from_node]
@@ -1520,6 +1831,9 @@ def optimize():
             "extended_refrigerate": extended_refrigerate,
             "extended_time_matrix": extended_time_matrix,
             "split_mapping": split_mapping,
+            "es_retiro": es_retiro,
+            "retiro_kg": retiro_kg,
+            "retiro_palets": retiro_palets,
             "node_group": node_group,
             # None si se pueden mezclar zonas: las revisiones lo usan para saberlo.
             "node_zona_clase": (None if mezclar_zonas else node_zona_clase),
@@ -1539,7 +1853,9 @@ def optimize():
         diag.info("CARGA",
                   f"Carga total {_num(sum(extended_demands[1:]))} kg de "
                   f"{_num(sum(vehicle_capacities_base))} kg disponibles "
-                  f"({len(extended_locations) - 1} paradas).")
+                  f"({len(nodos_entrega)} paradas"
+                  + (f" y {len(nodos_retiro)} retiro(s) por {_num_justo(sum(retiro_kg))} kg"
+                     if nodos_retiro else "") + ").")
 
         if esperas_recortadas:
             for nombre, original, tope in esperas_recortadas[:10]:
@@ -1623,12 +1939,16 @@ def optimize():
             prioridad_unimarc_tag = "UNIMARC CD"
 
             is_pa_node, is_lv_node, is_tottus_node, is_unimarc_node, is_nicolas_palma_node = [], [], [], [], []
-            for loc in extended_locations:
+            for _i_loc, loc in enumerate(extended_locations):
                 ident = (loc.get("identificador", "") or "").upper()
-                is_pa_node.append(prioridad_pa_tag in ident)
-                is_lv_node.append(prioridad_lv_tag in ident)
-                is_tottus_node.append(prioridad_tottus_tag in ident)
-                is_unimarc_node.append(prioridad_unimarc_tag in ident)
+                # Las prioridades de primera parada son de las ENTREGAS: un
+                # retiro en Punto Azul no las activa ni las paga (D5).
+                ident_prio = "" if es_retiro[_i_loc] else ident
+                is_pa_node.append(prioridad_pa_tag in ident_prio)
+                is_lv_node.append(prioridad_lv_tag in ident_prio)
+                is_tottus_node.append(prioridad_tottus_tag in ident_prio)
+                is_unimarc_node.append(prioridad_unimarc_tag in ident_prio)
+                # La segunda ventana es del local: también vale para su retiro.
                 is_nicolas_palma_node.append(
                     "NICOLAS PALMA" in ident or "NICOLÁS PALMA" in ident
                 )
@@ -1642,6 +1962,8 @@ def optimize():
             if "grupos" not in relajar:
                 for node_index in range(1, num_nodes):
                     g = node_group[node_index]
+                    if g == GRUPO_RETIRO:
+                        continue  # neutro: entra en cualquier modo (D5)
                     node_idx = manager.NodeToIndex(node_index)
                     if g == "WALMART":
                         allowed = {MODE_W}
@@ -1783,8 +2105,11 @@ def optimize():
                             # grupos: es el orden permitido. Al revés el arco ni
                             # existe (ver «van ANTES que Cencosud CD»).
                             antes_de_cencosud = acompana_a_cencosud[from_node] and g_to == "CENCOSUD"
+                            # Un retiro es neutro: pasar de Walmart o Cencosud
+                            # a un retiro no es mezclar grupos (D5).
+                            con_retiro = GRUPO_RETIRO in (g_from, g_to)
 
-                            if not antes_de_cencosud:
+                            if not antes_de_cencosud and not con_retiro:
                                 if g_from != g_to and ("WALMART" in (g_from, g_to) or "CENCOSUD" in (g_from, g_to)):
                                     base += HIGH_PENALTY
 
@@ -2071,6 +2396,47 @@ def optimize():
             for v in range(num_vehicles):
                 stops_dimension.CumulVar(routing.End(v)).SetMax(paradas_eff)
 
+            # -------------------------------------------------------------------------
+            # RETIROS (§4.3 del plan). Sólo si la solicitud trae alguno: sin
+            # retiros el modelo es exactamente el de antes.
+            # -------------------------------------------------------------------------
+            if nodos_retiro:
+                # Primero se entrega, después se retira (D1): no existe el arco
+                # de un retiro a una entrega. Una vez que un camión retira,
+                # sólo le quedan otros retiros o volver al packing.
+                indices_entrega = [manager.NodeToIndex(n) for n in nodos_entrega]
+                for r in nodos_retiro:
+                    siguiente_r = routing.NextVar(manager.NodeToIndex(r))
+                    for e_idx in indices_entrega:
+                        siguiente_r.RemoveValue(e_idx)
+
+                # Lo retirado ocupa el camión por separado de lo entregado
+                # (cuando empieza a cargar, lo entregado ya bajó): sus propios
+                # kilos y palets contra la capacidad del camión. Hacia arriba,
+                # para no dejar pasar un retiro que no cabe por decimales.
+                retiro_kg_int = [int(math.ceil(round(k, 6))) for k in retiro_kg]
+
+                def retiro_kg_callback(from_index):
+                    return retiro_kg_int[manager.IndexToNode(from_index)]
+                routing.AddDimensionWithVehicleCapacity(
+                    routing.RegisterUnaryTransitCallback(retiro_kg_callback), 0, vehicle_capacities, True,
+                    "RetiroKg"
+                )
+
+                retiro_palets_scaled = [int(math.ceil(round(p * PALET_SCALE, 6))) for p in retiro_palets]
+
+                def retiro_palets_callback(from_index):
+                    return retiro_palets_scaled[manager.IndexToNode(from_index)]
+                routing.AddDimensionWithVehicleCapacity(
+                    routing.RegisterUnaryTransitCallback(retiro_palets_callback), 0, vehicle_palets_scaled, True,
+                    "RetiroPalets"
+                )
+
+                # Opcional (D7): el solver lo deja fuera sólo si no cabe; la
+                # multa es la del diagnóstico, mucho mayor que cualquier costo.
+                for r in nodos_retiro:
+                    routing.AddDisjunction([manager.NodeToIndex(r)], PENALIZACION_DESCARTE)
+
             time_dimension.SetGlobalSpanCostCoefficient(50)
 
             costo_varias_rutas = True
@@ -2084,7 +2450,7 @@ def optimize():
             # se usan en el diagnóstico, nunca en la corrida real, para no
             # devolver en silencio una ruta a la que le faltan locales.
             if permitir_descartes:
-                for _n in range(1, num_nodes):
+                for _n in nodos_entrega:  # los retiros ya tienen la suya
                     routing.AddDisjunction([manager.NodeToIndex(_n)], PENALIZACION_DESCARTE)
 
             return {
@@ -2221,8 +2587,10 @@ def optimize():
 
         # ----------------------------- Extracción -------------------------------
         vehicle_trips = {}
+        rutas_resueltas = []   # para explicar los retiros que quedaron fuera
         total_distance, total_fuel_liters = 0.0, 0.0
         total_kg, total_units, total_palets_sum = 0.0, 0.0, 0.0
+        total_kg_retiro, total_palets_retiro = 0.0, 0.0
 
         total_time_minutes_total = 0      
         total_time_minutes_drive = 0      
@@ -2440,6 +2808,10 @@ def optimize():
                         margin_open = int(eff_open_from_dep) - int(arrival_from_departure)
 
                     deliveries.append({
+                        # «retiro»: el camión va a buscar (§4.5 del plan); no
+                        # trae productos ni kilos de entrega, y su eco va en
+                        # "retiro". «entrega»: lo de siempre.
+                        "tipo": "retiro" if es_retiro[node] else "entrega",
                         "location_id": loc_id,
                         "identificador": ext.get("identificador"),
                         "node_index": node,
@@ -2496,6 +2868,8 @@ def optimize():
                             "stops_cumul":           int(stops_cumul)
                         }
                     })
+                    if es_retiro[node]:
+                        deliveries[-1]["retiro"] = dict(retiro_info_nodo[node])
 
                 prev = index
                 index = solution.Value(routing.NextVar(index))
@@ -2519,12 +2893,52 @@ def optimize():
             fuel = dist_v / max(vehicle_consume[v], 1e-9)
             total_fuel_liters += fuel
 
+            # Lo que hace falta para explicar un retiro que quedó fuera: dónde y
+            # a qué hora termina este camión sus entregas, y lo que le queda.
+            if nodos_retiro:
+                # Con el horario del camión (el que ve la pre-ruta) si lo hay;
+                # si no, con los tiempos del solver, saliendo lo antes posible.
+                _k_entregas = [k for k, n in enumerate(_nodos_viaje) if not es_retiro[n]]
+                if horario is not None:
+                    _ultima_entrega = _nodos_viaje[_k_entregas[-1]] if _k_entregas else depot
+                    _sale_de_ultima = horario["salidas"][_k_entregas[-1]] if _k_entregas else horario["salida"]
+                else:
+                    _ultima_entrega, _sale_de_ultima = depot, solution.Value(time_dimension.CumulVar(start))
+                    _previo_r = depot
+                    for _n_r in _nodos_viaje:
+                        if not es_retiro[_n_r]:
+                            _llega = solution.Value(time_dimension.CumulVar(manager.NodeToIndex(_n_r)))
+                            _abre = extended_opening[_n_r]
+                            _inicio = max(_llega, int(_abre)) if _abre is not None else _llega
+                            _servicio = (0 if is_shared_warehouse_pair(_previo_r, _n_r)
+                                         else int(round(extended_wait[_n_r])))
+                            _ultima_entrega, _sale_de_ultima = _n_r, _inicio + _servicio
+                        _previo_r = _n_r
+                _previo_r = _nodos_viaje[-1] if _nodos_viaje else depot
+                rutas_resueltas.append({
+                    "base": main_vehicle,
+                    "zona": vehicle_zona.get(v),
+                    "ultima_entrega": _ultima_entrega,
+                    "sale_de_ultima_entrega": _sale_de_ultima,
+                    "ultimo": _previo_r,
+                    "kg_libre": vehicle_capacities[v] - sum(retiro_kg[n] for n in _nodos_viaje if es_retiro[n]),
+                    "palets_libre": (None if vehicle_palets[v] >= PALLET_INF
+                                     else vehicle_palets[v] - sum(retiro_palets[n] for n in _nodos_viaje
+                                                                  if es_retiro[n])),
+                    "paradas_libres": maximo_de_paradas - int(stops_count),
+                    "conduccion": int(time_drive),
+                })
+
             if not deliveries:
                 continue
             trip_kg = sum((d["totals"]["kg"] for d in deliveries if d.get("totals")), 0.0)
             trip_units_vals = [d["totals"].get("units") for d in deliveries if d.get("totals")]
             trip_units_sum = sum((u for u in trip_units_vals if u is not None), 0.0)
             trip_palets_sum = sum(d["totals"].get("palets", 0.0) for d in deliveries if d.get("totals"))
+            # Lo que el camión trae de vuelta: aparte, nunca sumado a la carga.
+            retiros_del_viaje = [d for d in deliveries if d.get("tipo") == "retiro"]
+            trip_kg_retiro = sum(d["retiro"]["kg"] for d in retiros_del_viaje)
+            trip_palets_retiro = sum(d["retiro"]["palets"] for d in retiros_del_viaje)
 
             raw_route = [0] + [
                 extended_locations[n].get("id") if n else 0
@@ -2609,6 +3023,8 @@ def optimize():
                 "total_kg": 0.0,
                 "total_units": 0.0,
                 "total_palets": 0.0,
+                "total_kg_retiro": 0.0,
+                "total_palets_retiro": 0.0,
                 "total_time_minutes_total": 0,
                 "total_time_minutes_drive": 0,
                 "total_stops": 0,
@@ -2637,7 +3053,10 @@ def optimize():
                 "fuel_liters": float(fuel),
                 "total_kg": round(trip_kg, 2),
                 "total_units": (round(trip_units_sum, 2) if trip_units_sum > 0 else None),
-                "total_palets": round(trip_palets_sum, 2)
+                "total_palets": round(trip_palets_sum, 2),
+                "num_retiros": len(retiros_del_viaje),
+                "total_kg_retiro": round(trip_kg_retiro, 2),
+                "total_palets_retiro": round(trip_palets_retiro, 2),
             })
 
             agg["total_distance"] += float(dist_v)
@@ -2645,6 +3064,8 @@ def optimize():
             agg["total_kg"] += float(trip_kg)
             agg["total_units"] += float(trip_units_sum)
             agg["total_palets"] += float(trip_palets_sum)
+            agg["total_kg_retiro"] += float(trip_kg_retiro)
+            agg["total_palets_retiro"] += float(trip_palets_retiro)
 
             agg["total_time_minutes_total"] += duration_end
             agg["total_time_minutes_drive"] += int(time_drive)
@@ -2654,6 +3075,8 @@ def optimize():
             total_kg += float(trip_kg)
             total_units += float(trip_units_sum)
             total_palets_sum += float(trip_palets_sum)
+            total_kg_retiro += float(trip_kg_retiro)
+            total_palets_retiro += float(trip_palets_retiro)
 
         # ─────────────────────────────────────────────────────────────────────
         # POST-PROCESAMIENTO: MODOS
@@ -2688,19 +3111,45 @@ def optimize():
         # Locales que quedaron sin ninguna entrega: con todos los nodos
         # obligatorios no debería pasar, pero si pasa hay que decirlo en vez de
         # devolver una ruta a la que le faltan paradas.
-        _servidos = {d.get("location_id")
-                     for vd in vehicle_trips.values()
-                     for t in vd.get("trips", [])
-                     for d in t.get("deliveries", [])}
+        # Sólo las entregas: un retiro que quedó fuera no es un local sin visita,
+        # va en `retiros_sin_planificar` (abajo).
+        _paradas_resueltas = [d for vd in vehicle_trips.values()
+                              for t in vd.get("trips", [])
+                              for d in t.get("deliveries", [])]
+        _servidos = {d.get("location_id") for d in _paradas_resueltas if d.get("tipo") != "retiro"}
         _sin_servir = sorted({_nombre_local(l, i) for i, l in enumerate(extended_locations)
-                              if i > 0 and l.get("id") not in _servidos})
+                              if i > 0 and not es_retiro[i] and l.get("id") not in _servidos})
         if _sin_servir:
             diag.aviso("LOCAL_SIN_VISITA",
                        f"Quedaron sin visita: {', '.join(_sin_servir[:10])}")
 
+        # ── Retiros que quedaron fuera (D7), con el motivo ─────────────────
+        retiros_sin_planificar = []
+        if nodos_retiro:
+            _retirados = {d.get("node_index") for d in _paradas_resueltas if d.get("tipo") == "retiro"}
+            _usados = {r["base"] for r in rutas_resueltas}
+            _libres = [(b, vehicle_start_offsets_base[b]) for b in range(base_num_vehicles) if b not in _usados]
+            for i in nodos_retiro:
+                if i in _retirados:
+                    continue
+                _loc = extended_locations[i]
+                _motivo = _motivo_del_retiro_sin_planificar(i, ctx, rutas_resueltas, _libres)
+                retiros_sin_planificar.append({
+                    "location_id": _loc.get("id"),
+                    "identificador": _loc.get("identificador"),
+                    "local": _nombre_local(_loc, i),
+                    "zona": _loc.get("zona"),
+                    "retiro": dict(retiro_info_nodo[i]),
+                    "motivo": _motivo,
+                })
+                diag.aviso("RETIRO_SIN_PLANIFICAR",
+                           f"{_nombre_local(_loc, i)}: el retiro quedó fuera de la ruta: {_motivo}.")
+
         diag.info("RESULTADO",
                   f"Ruta lista: {len(vehicle_trips)} camión(es), {total_stops_global} paradas, "
-                  f"{_num(total_distance, 1)} km, {_num(total_kg)} kg.")
+                  f"{_num(total_distance, 1)} km, {_num(total_kg)} kg"
+                  + (f"; {len(nodos_retiro) - len(retiros_sin_planificar)} de {len(nodos_retiro)} retiro(s), "
+                     f"{_num_justo(total_kg_retiro)} kg de vuelta" if nodos_retiro else "") + ".")
         update_job_status(job_id, "completado", "Optimización finalizada exitosamente.", 100)
 
         return jsonify({
@@ -2708,6 +3157,9 @@ def optimize():
             "avisos": diag.mensajes("aviso"),
             "log": diag.resumen(),
             "locales_sin_visita": _sin_servir,
+            # Siempre presente (también vacía): la app sabe así que este servicio
+            # conoce los retiros (la guardia del §4.6 del plan).
+            "retiros_sin_planificar": retiros_sin_planificar,
             "meta": {
                 "max_vehicles": base_num_vehicles,
                 "max_trips_per_vehicle": max_trips_per_vehicle,
@@ -2730,7 +3182,9 @@ def optimize():
                 "max_vehicle_time_minutes_total": int(max_vehicle_time_total),
                 "max_vehicle_time_minutes_drive": int(max_vehicle_time_drive),
                 "avg_vehicle_time_minutes_total": int(round(avg_vehicle_time_total)),
-                "avg_vehicle_time_minutes_drive": int(round(avg_vehicle_time_drive))
+                "avg_vehicle_time_minutes_drive": int(round(avg_vehicle_time_drive)),
+                "retiros": {"pedidos": len(nodos_retiro),
+                            "planificados": len(nodos_retiro) - len(retiros_sin_planificar)},
             },
             "totals": {
                 "total_distance": round(total_distance, 2),
@@ -2740,7 +3194,10 @@ def optimize():
                 "total_palets": round(total_palets_sum, 2),
                 "total_time_minutes_total": int(total_time_minutes_total),
                 "total_time_minutes_drive": int(total_time_minutes_drive),
-                "total_stops": int(total_stops_global)
+                "total_stops": int(total_stops_global),
+                # Lo que vuelve en los retiros: aparte, nunca sumado a total_kg.
+                "total_kg_retiro": round(total_kg_retiro, 2),
+                "total_palets_retiro": round(total_palets_retiro, 2),
             },
             "vehicles_used": len(vehicle_trips),
             "assignments": list(vehicle_trips.values())

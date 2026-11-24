@@ -303,6 +303,77 @@ def _zona_clase(zona) -> str:
     return ZONA_METRO if "METROPOLITANA" in str(zona or "").upper() else ZONA_OTRA
 
 
+# ── Prioridad de zona de un camión (pedido del usuario, 24-11-2026) ─────────
+# Un camión puede tener prioridad «REGION METROPOLITANA» o «QUINTA REGION»
+# (en bd_teruel, trucks.zona_prioritaria). Llega en `vehicle_zona_prioridad`,
+# una por camión en el orden de los demás `vehicle_*`; null = sin prioridad.
+# Decisiones del usuario:
+#   · un camión con prioridad NUNCA reparte fuera de su zona (regla dura): ni
+#     un local de otra zona o sin zona, ni su retiro;
+#   · los camiones sin prioridad pueden ayudar en esa zona si hace falta, pero
+#     el de la prioridad va primero: cada parada de una zona que tiene un
+#     camión con prioridad en la selección le cuesta PRIORIDAD_ZONA_PENALTY a
+#     un camión sin prioridad (del orden de las multas de primera parada).
+# Es de la Región Metropolitana toda zona que dice METROPOLITANA (como
+# _zona_clase, también «… ZONA ORIENTE»), y de la Quinta Región la que dice
+# QUINTA. Vale siempre, se mezclen o no las zonas.
+PRIORIDAD_METRO = "METRO"
+PRIORIDAD_QUINTA = "QUINTA"
+PRIORIDAD_ETIQUETAS = {PRIORIDAD_METRO: "Región Metropolitana", PRIORIDAD_QUINTA: "Quinta Región"}
+PRIORIDAD_ZONA_PENALTY = 60_000
+
+
+def _zona_de_prioridad(zona):
+    """METRO, QUINTA o None (otra zona o sin zona)."""
+    texto = str(zona or "").upper()
+    if "METROPOLITANA" in texto:
+        return PRIORIDAD_METRO
+    if "QUINTA" in texto:
+        return PRIORIDAD_QUINTA
+    return None
+
+
+def _leer_prioridades(valores, n):
+    """La prioridad de cada camión (METRO, QUINTA o None). Devuelve
+    (prioridades, error): un largo distinto o una zona que no es de las dos es
+    un error de la aplicación."""
+    if valores is None:
+        return [None] * n, None
+    if not isinstance(valores, list) or len(valores) != n:
+        return None, "vehicle_zona_prioridad no coincide con max_vehicles"
+    prioridades = []
+    for valor in valores:
+        if valor in (None, ""):
+            prioridades.append(None)
+            continue
+        prioridad = _zona_de_prioridad(valor)
+        if prioridad is None:
+            return None, (f"vehicle_zona_prioridad: «{valor}» no es una zona con prioridad "
+                          "(REGION METROPOLITANA o QUINTA REGION)")
+        prioridades.append(prioridad)
+    return prioridades, None
+
+
+def _cuantos_camiones(n):
+    return "1 camión" if n == 1 else f"{n} camiones"
+
+
+def _resumen_de_prioridades(prioridades):
+    """«Los 2 camiones elegidos tienen prioridad Región Metropolitana» o el reparto."""
+    conteo = {}
+    for p in prioridades:
+        conteo[p] = conteo.get(p, 0) + 1
+    if len(conteo) == 1 and None not in conteo:
+        (p, k), = conteo.items()
+        return (f"El camión elegido tiene prioridad {PRIORIDAD_ETIQUETAS[p]}." if k == 1
+                else f"Los {k} camiones elegidos tienen prioridad {PRIORIDAD_ETIQUETAS[p]}.")
+    partes = [f"{_cuantos_camiones(k)} con prioridad {PRIORIDAD_ETIQUETAS[p]}"
+              for p, k in conteo.items() if p is not None]
+    if None in conteo:
+        partes.append(f"{_cuantos_camiones(conteo[None])} sin prioridad")
+    return "Camiones elegidos: " + ", ".join(partes) + "."
+
+
 def _leer_bool(valor, por_defecto):
     """true/false del JSON, o «1»/«0» y «true»/«false» como texto."""
     if valor is None:
@@ -571,6 +642,62 @@ def revisar_factibilidad(ctx, diag):
             ],
             datos={"demanda_kg": demanda_total, "capacidad_kg": capacidad_total, "faltan_kg": faltan},
         ))
+
+    # ── Prioridad de zona (24-11-2026) ────────────────────────────────────
+    # Un camión con prioridad no sale de su zona: un local de otra zona solo
+    # lo pueden llevar los camiones sin prioridad (o los de su zona).
+    prioridades = ctx.get("vehicle_prioridad_base") or []
+    if any(prioridades):
+        zonas_nodo = ctx["node_zona_prioridad"]
+        entregas = [i for i in range(1, ctx["num_nodes"]) if not ctx["es_retiro"][i]]
+
+        def _donde(i):
+            return PRIORIDAD_ETIQUETAS.get(zonas_nodo[i]) or (ctx["extended_locations"][i].get("zona") or "Sin zona")
+
+        sin_camion = [i for i in entregas if all(p is not None and p != zonas_nodo[i] for p in prioridades)]
+        if sin_camion:
+            por_zona = {}
+            for i in sin_camion:
+                por_zona.setdefault(_donde(i), set()).add(_nombre_local(ctx["extended_locations"][i], i))
+            problemas.append(ErrorOptimizacion(
+                "PRIORIDAD_DE_ZONA",
+                "Hay locales a los que no puede ir ningún camión elegido: todos tienen prioridad de otra zona.",
+                detalle=[f"{zona}: {', '.join(sorted(nombres)[:10])}." for zona, nombres in sorted(por_zona.items())]
+                        + [_resumen_de_prioridades(prioridades),
+                           "Un camión con prioridad de zona solo reparte en su zona."],
+                sugerencias=[
+                    "Agrega un camión sin prioridad de zona, o uno con la prioridad de esa zona.",
+                    "O cambia la prioridad del camión en su ficha (Camiones).",
+                    "O saca esos locales de esta ruta.",
+                ],
+                datos={"locales": sorted({n for ns in por_zona.values() for n in ns})},
+            ))
+        else:
+            # La carga de cada conjunto de zonas tiene que caber en los camiones
+            # que pueden ir a alguna de ellas (si no, ningún reparto la arma).
+            zonas_presentes = sorted({zonas_nodo[i] for i in entregas}, key=lambda z: (z is None, z or ""))
+            for k in range(1, 1 << len(zonas_presentes)):
+                juntas = [z for b, z in enumerate(zonas_presentes) if k >> b & 1]
+                kg = sum(ctx["extended_demands"][i] for i in entregas if zonas_nodo[i] in juntas)
+                pueden = [b for b, p in enumerate(prioridades) if p is None or p in juntas]
+                capacidad = sum(ctx["vehicle_capacities_base"][b] for b in pueden)
+                if kg > capacidad:
+                    nombres = [PRIORIDAD_ETIQUETAS.get(z) or "las zonas sin camión con prioridad" for z in juntas]
+                    problemas.append(ErrorOptimizacion(
+                        "PRIORIDAD_DE_ZONA_CAPACIDAD",
+                        f"La carga de {' y '.join(nombres)} no cabe en los camiones que pueden ir ahí.",
+                        detalle=[
+                            f"Carga: {_num(kg)} kg. Camiones que pueden ir: {len(pueden)}, con {_num(capacidad)} kg.",
+                            _resumen_de_prioridades(prioridades),
+                            "Un camión con prioridad de zona solo reparte en su zona.",
+                        ],
+                        sugerencias=[
+                            "Agrega un camión sin prioridad de zona, o uno con la prioridad de esa zona.",
+                            "O cambia la prioridad del camión en su ficha (Camiones).",
+                        ],
+                        datos={"zonas": nombres, "kg": kg, "capacidad_kg": capacidad},
+                    ))
+                    break
 
     # ── Palets ────────────────────────────────────────────────────────────
     palets_total = sum(ctx["extended_palets"][1:])
@@ -956,6 +1083,12 @@ def revisar_ventanas(ctx, diag):
 # busca la mejor ruta, sólo saber si existe alguna.
 
 RELAJACIONES = [
+    # Solo se prueba si algún camión tiene prioridad de zona (24-11-2026).
+    ("prioridad_zona", "PRIORIDAD_DE_ZONA",
+     "La prioridad de zona de los camiones impide armar la ruta: los que tienen prioridad no salen de su zona "
+     "y los demás no alcanzan para el resto.",
+     ["Agrega un camión sin prioridad de zona.",
+      "O cambia la prioridad del camión en su ficha (Camiones)."]),
     # Solo se prueba si se pidió no mezclar zonas (ver diagnosticar_infactibilidad).
     ("zonas", "ZONAS_SEPARADAS",
      "La regla de no mezclar la Región Metropolitana con otras zonas impide armar la ruta.",
@@ -1054,6 +1187,15 @@ def _motivo_probable_del_descarte(i, ctx):
         return (f"la descarga ({servicio} min) dura más que su horario y el camión tiene que llegar "
                 f"antes de que abra ({_fmt_hhmm(ref + apertura)}): no calza con el resto de las paradas")
 
+    prioridades = ctx.get("vehicle_prioridad_base") or []
+    if any(prioridades):
+        zona_i = ctx["node_zona_prioridad"][i]
+        pueden = [p for p in prioridades if p is None or p == zona_i]
+        if len(pueden) < len(prioridades):
+            donde = PRIORIDAD_ETIQUETAS.get(zona_i) or (loc.get("zona") or "sin zona")
+            return (f"es de {donde} y solo {len(pueden)} de los {len(prioridades)} camiones pueden ir ahí "
+                    f"(los demás tienen prioridad de otra zona): no encaja dentro de sus tiempos")
+
     if ctx.get("node_zona_clase") is not None:
         zona = {ZONA_METRO: "de la Región Metropolitana", ZONA_OTRA: "de otras zonas"}.get(
             ctx["node_zona_clase"][i], "de su zona")
@@ -1090,10 +1232,18 @@ def _motivo_del_retiro_sin_planificar(i, ctx, rutas, camiones_libres):
     kg, pal = ctx["retiro_kg"][i], ctx["retiro_palets"][i]
     minutos = int(round(ctx["extended_wait"][i]))
 
+    prioridades = ctx.get("vehicle_prioridad_base") or [None] * ctx["base_num_vehicles"]
+    zona_prioridad = (ctx.get("node_zona_prioridad") or [None] * ctx["num_nodes"])[i]
+
+    def _puede_ir(base):  # un camión con prioridad no sale de su zona
+        return prioridades[base] is None or prioridades[base] == zona_prioridad
+
     candidatos = []
     for r in rutas:
         if zonas is not None and r["zona"] is not None and r["zona"] != zonas[i]:
             continue  # sin mezclar zonas, sólo los camiones de su zona
+        if not _puede_ir(r["base"]):
+            continue
         ultimo = r["ultimo"]
         desvio = int(round(tiempos[ultimo][i] + tiempos[i][0] - tiempos[ultimo][0]))
         candidatos.append({
@@ -1102,6 +1252,8 @@ def _motivo_del_retiro_sin_planificar(i, ctx, rutas, camiones_libres):
             "paradas_libres": r["paradas_libres"], "conduccion": r["conduccion"] + desvio,
         })
     for base, salida in camiones_libres:
+        if not _puede_ir(base):
+            continue
         palets = ctx["vehicle_palets_base"][base]
         candidatos.append({
             "llegada": int(salida or 0) + int(round(tiempos[0][i])),
@@ -1238,7 +1390,9 @@ def diagnosticar_infactibilidad(construir_modelo, ctx, diag, segundos_por_intent
 
     # ── Paso 2: soltar una restricción a la vez ───────────────────────────
     # «zonas» solo si se pidió no mezclarlas: si no, soltarla no cambia nada.
-    relajaciones = [r for r in RELAJACIONES if r[0] != "zonas" or ctx.get("node_zona_clase") is not None]
+    relajaciones = [r for r in RELAJACIONES
+                    if (r[0] != "zonas" or ctx.get("node_zona_clase") is not None)
+                    and (r[0] != "prioridad_zona" or any(ctx.get("vehicle_prioridad_base") or []))]
     for n_prueba, (clave, codigo, mensaje, sugerencias) in enumerate(relajaciones, start=1):
         update_job_status(diag.job_id, "diagnosticando",
                           f"Buscando la causa: probando sin «{clave}» ({n_prueba} de {len(relajaciones)})...",
@@ -1484,6 +1638,13 @@ def optimize():
             return jsonify(error="vehicle_free no coincide con max_vehicles"), 400
         if len(vehicle_palets_base) != base_num_vehicles:
             return jsonify(error="palets por vehículo no coincide con max_vehicles"), 400
+        # Prioridad de zona de cada camión (24-11-2026, ver _zona_de_prioridad).
+        vehicle_prioridad_base, _error_prioridad = _leer_prioridades(data.get("vehicle_zona_prioridad"),
+                                                                     base_num_vehicles)
+        if _error_prioridad:
+            return jsonify(error=_error_prioridad), 400
+        hay_prioridades = any(vehicle_prioridad_base)
+        zonas_con_prioridad = {p for p in vehicle_prioridad_base if p}
 
         PALLET_INF = 10**9
         try:
@@ -1743,6 +1904,7 @@ def optimize():
         node_group = [GRUPO_RETIRO if es_retiro[i] else _group(loc.get("identificador", ""))
                       for i, loc in enumerate(extended_locations)]
         node_zona_clase = [_zona_clase(loc.get("zona")) for loc in extended_locations]
+        node_zona_prioridad = [_zona_de_prioridad(loc.get("zona")) for loc in extended_locations]
         # Locales cuya descarga dura más que su horario: se atienden si el camión
         # llega antes de que abran (el tope de llegada pasa a ser la apertura).
         antes_de_abrir = [False] + [
@@ -1837,6 +1999,9 @@ def optimize():
             "node_group": node_group,
             # None si se pueden mezclar zonas: las revisiones lo usan para saberlo.
             "node_zona_clase": (None if mezclar_zonas else node_zona_clase),
+            # Prioridad de zona por camión (None = sin) y la zona de cada nodo para ella.
+            "vehicle_prioridad_base": vehicle_prioridad_base,
+            "node_zona_prioridad": node_zona_prioridad,
             "antes_de_abrir": antes_de_abrir,
             "num_nodes": num_nodes,
             "base_num_vehicles": base_num_vehicles,
@@ -1868,6 +2033,11 @@ def optimize():
             diag.info("ZONAS_SEPARADAS",
                       f"No se mezclan zonas: {_n_metro} parada(s) de la Región Metropolitana y "
                       f"{num_nodes - 1 - _n_metro} de otras zonas van en camiones distintos.")
+
+        if hay_prioridades:
+            diag.info("PRIORIDAD_DE_ZONA",
+                      _resumen_de_prioridades(vehicle_prioridad_base) +
+                      " Un camión con prioridad solo reparte en su zona; los demás pueden ayudar ahí si hace falta.")
 
         problemas = revisar_factibilidad(ctx, diag)
         ventanas_duras, ventanas_avisos = revisar_ventanas(ctx, diag)
@@ -1987,6 +2157,16 @@ def optimize():
                         if vehicle_zona[v] is not None and vehicle_zona[v] != node_zona_clase[node_index]:
                             routing.VehicleVar(node_idx).RemoveValue(v)
 
+            # ── Prioridad de zona: un camión con prioridad solo reparte en su
+            #    zona (24-11-2026). También sus retiros. ──
+            if hay_prioridades and "prioridad_zona" not in relajar:
+                for node_index in range(1, num_nodes):
+                    node_idx = manager.NodeToIndex(node_index)
+                    for v in range(num_vehicles):
+                        prioridad = vehicle_prioridad_base[vehicle_mapping[v]]
+                        if prioridad is not None and prioridad != node_zona_prioridad[node_index]:
+                            routing.VehicleVar(node_idx).RemoveValue(v)
+
             solver = routing.solver()
 
             # ── Un camión físico solo puede activar UN modo virtual por trip ──
@@ -2052,11 +2232,17 @@ def optimize():
 
             for v in range(num_vehicles):
                 def make_vehicle_callback(v_idx):
+                    # Sin prioridad propia, en una zona que tiene camión con prioridad paga la multa.
+                    paga_zona_ajena = bool(zonas_con_prioridad) and vehicle_prioridad_base[vehicle_mapping[v_idx]] is None
+
                     def distance(from_index, to_index, rate=vehicle_consume[v_idx]):
                         from_node = manager.IndexToNode(from_index)
                         to_node   = manager.IndexToNode(to_index)
                         base_dist = extended_distance_matrix[from_node][to_node]
                         base = max(0, int(round((base_dist / max(rate, 1e-9)) * 1000)))
+
+                        if paga_zona_ajena and to_node != depot and node_zona_prioridad[to_node] in zonas_con_prioridad:
+                            base += PRIORIDAD_ZONA_PENALTY
 
                         if node_group[to_node] == "OTHER":
                             if to_node != depot and from_node == depot:
@@ -3011,6 +3197,8 @@ def optimize():
 
             agg = vehicle_trips.setdefault(main_vehicle, {
                 "vehicle": main_vehicle,
+                # «Región Metropolitana», «Quinta Región» o None (24-11-2026).
+                "zona_prioridad": PRIORIDAD_ETIQUETAS.get(vehicle_prioridad_base[main_vehicle]),
                 "departure_clock": departure_clock_v,
                 "departure_clock_solicitado": _salida_pedida_clock,
                 "departure_delay_minutes": _retraso,

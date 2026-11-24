@@ -122,6 +122,42 @@ local sin productos y sin retiro se sigue visitando, como siempre).
 ignoraría `retiro` y visitaría el local como una entrega vacía. Sin retiros en
 la solicitud, la respuesta es la de siempre más las claves nuevas en cero.
 
+## Prioridad de zona de un camión (24-11-2026)
+
+Pedido del usuario: «Hay camiones con prioridad de zona, donde la zona puede ser
+REGION METROPOLITANA o QUINTA REGION, de esta forma, el optimizador si el camion
+tiene esa prioridad de zona, la debe respetar». Se marca en la ficha del camión
+(`bd_teruel`: `trucks.zona_prioritaria`).
+
+**Entrada.** `vehicle_zona_prioridad`: una por camión, en el orden de los demás
+`vehicle_*`; `"REGION METROPOLITANA"`, `"QUINTA REGION"` o `null` (sin
+prioridad). Sin la clave, ningún camión tiene prioridad. Otro valor o un largo
+distinto de `max_vehicles` es un 400.
+
+**Reglas** (decisiones del usuario):
+
+- **Nunca fuera de su zona.** Un camión con prioridad solo reparte en su zona:
+  ni un local de otra zona o sin zona, ni su retiro (regla dura, `RemoveValue`).
+  La Región Metropolitana es toda zona que dice METROPOLITANA (también oriente,
+  poniente y sur); la Quinta Región, la que dice QUINTA. Vale se mezclen o no
+  las zonas.
+- **Va primero, los demás ayudan si hace falta.** Un camión sin prioridad paga
+  `PRIORIDAD_ZONA_PENALTY` (60.000, del orden de las multas de primera parada)
+  por cada parada de una zona que tiene un camión con prioridad en la selección.
+
+**Antes de calcular.** `PRIORIDAD_DE_ZONA`: hay locales a los que no puede ir
+ningún camión elegido (todos con prioridad de otra zona), con los locales por
+zona. `PRIORIDAD_DE_ZONA_CAPACIDAD`: la carga de una zona (o de varias juntas)
+no cabe en los camiones que pueden ir ahí. Si el solver no encuentra solución,
+el diagnóstico prueba soltar `prioridad_zona` (sólo si algún camión la tiene) y
+el motivo de un local o de un retiro que queda fuera la menciona.
+
+**Salida.** Cada camión de `assignments[]` trae `zona_prioridad`: «Región
+Metropolitana», «Quinta Región» o `null`.
+
+**Despliegue.** Este servicio va ANTES que la app que manda la prioridad: uno
+viejo ignora `vehicle_zona_prioridad` y repartiría sin respetarla.
+
 ## Cómo se explica un fallo
 
 Tres capas, de la más barata a la más cara:
@@ -194,6 +230,13 @@ sólo retiros con camiones sin frío; un camión de Walmart que retira; los
 minutos de carga sin recortar; el retiro más grande que el camión (kg y
 palets); los que quedan fuera por espacio, por horario, por el máximo de
 paradas, por «primero entregar» y por la zona; y un retiro mal formado.
+
+`tests/test_prioridad_zona.py` (9 pruebas): la zona de un local y la prioridad
+de un camión; sin prioridad, como siempre; un valor o un largo inválido; el
+camión con prioridad no sale de su zona y la toma primero (sin la multa, el
+local de su zona se lo llevaría el otro); si no le alcanza, el otro ayuda; la
+Región Metropolitana con sus zonas; un local al que ningún camión puede ir; la
+carga de una zona que no cabe; y un retiro fuera de la zona de todos.
 
 ## Puntos críticos y plan de mejora
 
